@@ -22,6 +22,7 @@ from codex_agent_console import (
     DUAL_MODE_POLICY_START,
     SessionTokenTail,
     SessionStatsReader,
+    build_dual_mode_policy,
     custom_api_base_url,
     custom_api_endpoint_url,
     choose_custom_api_winners,
@@ -135,6 +136,16 @@ class ConfigStoreTests(unittest.TestCase):
         enabled = merge_dual_mode_policy(None, True, "gpt-5.6-terra", "medium")
         self.assertTrue(has_dual_mode_policy(enabled))
         self.assertEqual(merge_dual_mode_policy(enabled, False), "")
+
+    def test_dual_mode_policy_prioritizes_simple_execution_for_subagents(self):
+        policy = build_dual_mode_policy("gpt-5.6-terra", "low")
+        self.assertIn(
+            "Route simple, bounded, low-risk execution work directly to the subagent",
+            policy,
+        )
+        self.assertIn("model to `gpt-5.6-terra`", policy)
+        self.assertIn("reasoning_effort to `low`", policy)
+        self.assertNotIn("Keep trivial work in the primary agent", policy)
 
 
 class SessionStatsTests(unittest.TestCase):

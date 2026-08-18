@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -85,7 +85,7 @@ def build_dual_mode_policy(subagent_model: str, subagent_effort: str) -> str:
     model = _policy_value(subagent_model)
     effort = _policy_value(subagent_effort)
     return f"""{DUAL_MODE_POLICY_START}
-For non-trivial implementation work, use the primary agent for planning, decomposition, integration, and final review. Delegate bounded implementation and execution tasks to subagents through the available multi-agent tools. When spawning an execution subagent, explicitly set model to `{model}` and reasoning_effort to `{effort}`; do not rely on inherited defaults. Only use a different subagent model or effort when the user explicitly requests it or the configured combination is unavailable. Keep trivial work in the primary agent, and do not delegate when coordination overhead outweighs the benefit.
+Route simple, bounded, low-risk execution work directly to the subagent instead of doing it in the primary agent. Do not keep that execution work in the primary agent because of coordination overhead. Keep pure explanations, clarification, user communication, and final responses in the primary agent. For non-trivial implementation work, use the primary agent for planning, decomposition, integration, and final review, and delegate bounded implementation and execution tasks to subagents through the available multi-agent tools. When spawning an execution subagent, explicitly set model to `{model}` and reasoning_effort to `{effort}`; do not rely on inherited defaults. Only use a different subagent model or effort when the user explicitly requests it or the configured combination is unavailable.
 {DUAL_MODE_POLICY_END}"""
 
 
@@ -1996,7 +1996,7 @@ class CodexAgentConsole:
         mode_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         ttk.Radiobutton(
             mode_frame,
-            text="双模型协调（主规划 + 子执行）",
+            text="双模型协调（简单执行优先子模型）",
             variable=self.mode_var,
             value="multi",
         ).pack(side="left", padx=(0, 18))
@@ -2056,7 +2056,7 @@ class CodexAgentConsole:
 
         ttk.Label(
             parent,
-            text="双模型会注入协调策略；设置仅对新任务生效。",
+            text="简单且独立的执行优先交给子模型；主模型负责规划、沟通和整合。设置仅对新任务生效。",
             style="Muted.TLabel",
         ).grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
