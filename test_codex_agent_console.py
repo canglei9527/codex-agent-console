@@ -6,7 +6,7 @@ import threading
 import tomllib
 import unittest
 from unittest import mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -323,6 +323,89 @@ class SessionStatsTests(unittest.TestCase):
             self.assertEqual(sub.cache_hit_rate, 50.0)
             self.assertEqual(sub.models, {"gpt-5.6-terra/medium": 1})
             self.assertEqual(sub.latest_model, "gpt-5.6-terra/medium")
+
+    def test_preserves_execution_subagent_identity_from_forked_history(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp)
+            self._write_session(
+                sessions / "main.jsonl",
+                "user",
+                [{"input_tokens": 100, "total_tokens": 100}],
+            )
+            now = datetime.now(timezone.utc)
+            child_started = now.isoformat()
+            parent_started = (now - timedelta(seconds=5)).isoformat()
+            records = [
+                {
+                    "timestamp": child_started,
+                    "type": "session_meta",
+                    "payload": {
+                        "timestamp": child_started,
+                        "thread_source": "subagent",
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "agent_role": "codex_agent_console_executor"
+                                }
+                            }
+                        },
+                    },
+                },
+                {
+                    "timestamp": parent_started,
+                    "type": "session_meta",
+                    "payload": {
+                        "timestamp": parent_started,
+                        "thread_source": "user",
+                    },
+                },
+                {
+                    "timestamp": parent_started,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6-terra", "effort": "xhigh"},
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "model": "gpt-5.5",
+                            "reasoning_effort": "xhigh",
+                        },
+                    },
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 60}},
+                    },
+                },
+            ]
+            (sessions / "execution.jsonl").write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            main, sub = SessionStatsReader(sessions).aggregate(None)
+
+            self.assertEqual(main.sessions, 1)
+            self.assertEqual(main.latest_model, "gpt-5.6-sol/high")
+            self.assertEqual(sub.sessions, 1)
+            self.assertEqual(sub.total_tokens, 60)
+            self.assertEqual(sub.models, {"gpt-5.5/xhigh": 1})
+            self.assertEqual(sub.latest_model, "gpt-5.5/xhigh")
+            self.assertEqual(
+                SessionStatsReader(sessions)._parse_file(sessions / "execution.jsonl").started_at,
+                datetime.fromisoformat(child_started),
+            )
 
 
 class DiagnosticLogicTests(unittest.TestCase):

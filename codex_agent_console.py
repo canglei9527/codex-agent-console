@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -1860,6 +1860,7 @@ class SessionStatsReader:
 
     def _parse_file(self, path: Path) -> ParsedSession | None:
         started_at: datetime | None = None
+        subagent_started_at: datetime | None = None
         is_subagent = False
         is_execution_subagent = False
         latest_tokens: dict[str, object] | None = None
@@ -1877,7 +1878,7 @@ class SessionStatsReader:
                         continue
                     if item.get("type") == "session_meta":
                         source = payload.get("source")
-                        is_subagent = payload.get("thread_source") == "subagent" or (
+                        record_is_subagent = payload.get("thread_source") == "subagent" or (
                             isinstance(source, dict) and "subagent" in source
                         )
                         source_subagent = (
@@ -1886,17 +1887,26 @@ class SessionStatsReader:
                         is_system_subagent = isinstance(source_subagent, dict) and bool(
                             source_subagent.get("other")
                         )
-                        is_execution_subagent = is_subagent and not is_system_subagent
+                        is_subagent = is_subagent or record_is_subagent
+                        is_execution_subagent = is_execution_subagent or (
+                            record_is_subagent and not is_system_subagent
+                        )
                         stamp = payload.get("timestamp") or item.get("timestamp")
                         if isinstance(stamp, str):
                             try:
-                                started_at = datetime.fromisoformat(
+                                record_started_at = datetime.fromisoformat(
                                     stamp.replace("Z", "+00:00")
                                 )
+                                if started_at is None:
+                                    started_at = record_started_at
+                                if record_is_subagent and subagent_started_at is None:
+                                    subagent_started_at = record_started_at
                             except ValueError:
                                 pass
                     if isinstance(payload.get("model"), str):
                         model = payload["model"]
+                    if isinstance(payload.get("effort"), str):
+                        reasoning_effort = payload["effort"]
                     collaboration = payload.get("collaboration_mode")
                     settings = (
                         collaboration.get("settings")
@@ -1907,6 +1917,12 @@ class SessionStatsReader:
                         settings.get("reasoning_effort"), str
                     ):
                         reasoning_effort = settings["reasoning_effort"]
+                    thread_settings = payload.get("thread_settings")
+                    if isinstance(thread_settings, dict):
+                        if isinstance(thread_settings.get("model"), str):
+                            model = thread_settings["model"]
+                        if isinstance(thread_settings.get("reasoning_effort"), str):
+                            reasoning_effort = thread_settings["reasoning_effort"]
                     if payload.get("type") == "token_count":
                         info = payload.get("info")
                         total = info.get("total_token_usage") if isinstance(info, dict) else None
@@ -1916,6 +1932,8 @@ class SessionStatsReader:
             return None
         if latest_tokens is None:
             return None
+        if subagent_started_at is not None:
+            started_at = subagent_started_at
         if started_at is None:
             started_at = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         elif started_at.tzinfo is None:

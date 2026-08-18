@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.6 - 2026-08-19
+
+- Correct execution-agent statistics when a forked subagent session embeds parent session metadata.
+- Read the current Codex `effort` and `thread_settings.reasoning_effort` fields so actual main and execution model cards show the configured reasoning level.
+- Preserve the execution subagent's own start time for accurate latest-model reporting.
+
 ## 1.3.5 - 2026-08-18
 
 - Move dual-model routing from `config.toml` developer instructions to the documented global `~/.codex/AGENTS.md` instruction chain, using a non-empty `AGENTS.override.md` when it is active.
