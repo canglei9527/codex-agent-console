@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.1 - 2026-08-18
+
+- Reduce automatic Token statistics refresh from five seconds to one second.
+- Keep configuration changes immediate while clearly retaining new-task scope.
+
 ## 1.0.0 - 2026-08-18
 
 - Add a native Windows GUI for Codex main-model and subagent defaults.

@@ -19,7 +19,8 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
+AUTO_REFRESH_MS = 1000
 MODELS = (
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -439,7 +440,7 @@ class CodexAgentConsole:
         self._build_ui()
         self._load_settings()
         self.refresh_stats()
-        self.root.after(5000, self._auto_refresh)
+        self.root.after(AUTO_REFRESH_MS, self._auto_refresh)
 
     def _configure_style(self) -> None:
         style = ttk.Style(self.root)
@@ -781,7 +782,7 @@ class CodexAgentConsole:
 
     def _auto_refresh(self) -> None:
         self.refresh_stats()
-        self.root.after(5000, self._auto_refresh)
+        self.root.after(AUTO_REFRESH_MS, self._auto_refresh)
 
     @staticmethod
     def _open_path(path: Path) -> None:
