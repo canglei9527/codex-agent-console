@@ -2,7 +2,7 @@
 
 一个非官方的 Codex Windows 桌面控制台，用于管理主模型、子代理默认值和双模型协调策略，并查看本机 Token 与缓存命中统计。
 
-当前版本：`1.3.4`
+当前版本：`1.3.5`
 
 > 本项目是社区工具，不是 OpenAI 官方产品。它只修改 Codex 官方支持的本地配置项。
 
@@ -15,7 +15,7 @@
 - 主模型：`model`、`model_reasoning_effort`
 - 子代理：`agents.default_subagent_model`、`agents.default_subagent_reasoning_effort`
 - 模式：`agents.enabled = true|false`
-- 双模型协调策略：启用时通过 `developer_instructions` 将简单、明确、低风险的执行直接交给一个专属子模型全程完成；复杂、模糊、多步骤或跨模块工作仍由主模型规划、拆解、整合和审查
+- 双模型协调策略：启用时写入全局 `~/.codex/AGENTS.md`（非空 `AGENTS.override.md` 优先），将简单、明确、低风险的写作、编码、改写、翻译、总结等任务直接交给一个专属子模型全程完成；复杂、模糊、多步骤或跨模块工作仍由主模型规划、拆解、整合和审查
 - 专属执行子模型：保存时在 `~/.codex/agents/` 写入受控代理文件，模型和思考级别严格使用 GUI 选择值，优先级高于子代理默认值
 - 一键按钮：“启用双模型”与“恢复普通模式”
 - 并发：`agents.max_concurrent_threads_per_session`
@@ -29,7 +29,7 @@
 - 自定义测速：比较成功率、平均首响应、平均总耗时、耗时波动和 Tokens/s，并标出最快与最稳定接口
 - API Key 安全：支持 Bearer、`x-api-key` 和无鉴权；Key 使用 Windows DPAPI 加密，不明文写入配置或显示在界面中
 
-配置保存前会备份为 `~/.codex/config.toml.codex-agent-console.bak`。控制台只增删自己带标记的协调策略，不会覆盖已有的 `developer_instructions`。保存后必须完全退出并重新打开 Codex Desktop，再新建任务；当前会话不会热切换。
+配置保存前会备份为 `~/.codex/config.toml.codex-agent-console.bak`。控制台只增删全局 `AGENTS.md` 或 `AGENTS.override.md` 中自己带标记的协调策略，不会覆盖已有的用户规则；旧版本写入 `developer_instructions` 的标记会自动迁移清除。保存后必须完全退出并重新打开 Codex Desktop，再新建任务；当前会话不会热切换。
 
 ## API 诊断
 

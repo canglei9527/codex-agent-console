@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -74,6 +74,8 @@ DUAL_MODE_POLICY_END = "[/Codex Agent Console: dual-model orchestration]"
 MANAGED_EXECUTOR_AGENT_NAME = "codex_agent_console_executor"
 MANAGED_EXECUTOR_AGENT_FILE = f"{MANAGED_EXECUTOR_AGENT_NAME}.toml"
 MANAGED_EXECUTOR_AGENT_MARKER = "# Managed by Codex Agent Console"
+GLOBAL_AGENTS_FILENAME = "AGENTS.md"
+GLOBAL_AGENTS_OVERRIDE_FILENAME = "AGENTS.override.md"
 _DUAL_MODE_POLICY_RE = re.compile(
     rf"{re.escape(DUAL_MODE_POLICY_START)}.*?{re.escape(DUAL_MODE_POLICY_END)}",
     re.DOTALL,
@@ -88,7 +90,7 @@ def build_dual_mode_policy(subagent_model: str, subagent_effort: str) -> str:
     model = _policy_value(subagent_model)
     effort = _policy_value(subagent_effort)
     return f"""{DUAL_MODE_POLICY_START}
-First make only a routing decision, without doing substantive task work. Simple execution work is a clear, bounded, low-risk task with one well-defined outcome that does not require cross-cutting design, multi-step investigation, or architectural decisions. For simple execution work, do not plan, decompose, inspect, implement, or test in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one custom execution subagent named `{MANAGED_EXECUTOR_AGENT_NAME}` through the available multi-agent tools. That subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning, decomposition, integration, and final review. Delegate bounded implementation and execution tasks to the `{MANAGED_EXECUTOR_AGENT_NAME}` subagent through the available multi-agent tools. Keep pure explanations, clarification questions, and user-facing status or final response handling in the primary agent. The `{MANAGED_EXECUTOR_AGENT_NAME}` configuration is authoritative for model `{model}` and reasoning effort `{effort}`; do not substitute a built-in worker, explorer, guardian, or inherited default. If the execution subagent tool is unavailable for simple execution work, report the blocker instead of silently taking over the work. Only use a different execution model or effort when the user explicitly requests it or the configured combination is unavailable.
+First make only a routing decision, without doing substantive task work. Treat every clear, bounded, low-risk, non-conversational user request as simple work, including coding, writing, rewriting, translation, summarization, data transformation, file operations, and targeted research. This instruction is an explicit request to use a subagent; do not wait for the user to ask separately. For simple work, do not plan, decompose, inspect, implement, test, or produce the requested result in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one custom execution subagent named `{MANAGED_EXECUTOR_AGENT_NAME}` through the available multi-agent tools. That subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. Only greetings, casual conversation, status updates, clarification questions, and direct answers that require no task work stay in the primary agent. For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning, decomposition, integration, and final review. Delegate all bounded execution work to the `{MANAGED_EXECUTOR_AGENT_NAME}` subagent through the available multi-agent tools. The `{MANAGED_EXECUTOR_AGENT_NAME}` configuration is authoritative for model `{model}` and reasoning effort `{effort}`; do not substitute a built-in worker, explorer, guardian, or inherited default. If the execution subagent tool is unavailable for simple work, report the blocker instead of silently taking over the task. Only use a different execution model or effort when the user explicitly requests it or the configured combination is unavailable.
 {DUAL_MODE_POLICY_END}"""
 
 
@@ -222,8 +224,13 @@ class ConfigStore:
         text = self.path.read_text(encoding="utf-8")
         data = tomllib.loads(text)
         agents = data.get("agents") if isinstance(data.get("agents"), dict) else {}
-        dual_mode_enabled = bool(agents.get("enabled", True)) and has_dual_mode_policy(
-            data.get("developer_instructions")
+        active_instruction_path = self.active_global_instruction_path
+        has_global_policy = active_instruction_path.exists() and has_dual_mode_policy(
+            active_instruction_path.read_text(encoding="utf-8")
+        )
+        has_legacy_policy = has_dual_mode_policy(data.get("developer_instructions"))
+        dual_mode_enabled = bool(agents.get("enabled", True)) and (
+            has_global_policy or has_legacy_policy
         )
         return AgentSettings(
             main_model=str(data.get("model") or "gpt-5.6-sol"),
@@ -252,16 +259,27 @@ class ConfigStore:
     def managed_executor_path(self) -> Path:
         return self.path.parent / "agents" / MANAGED_EXECUTOR_AGENT_FILE
 
-    def _save_managed_executor(self, settings: AgentSettings) -> None:
-        path = self.managed_executor_path
-        text = build_managed_executor_agent(
-            settings.subagent_model, settings.subagent_effort
-        )
-        tomllib.loads(text)
-        if path.exists():
-            existing = path.read_text(encoding="utf-8")
-            if MANAGED_EXECUTOR_AGENT_MARKER not in existing:
-                raise ValueError(f"执行代理文件已被用户占用：{path}")
+    @property
+    def global_agents_path(self) -> Path:
+        return self.path.parent / GLOBAL_AGENTS_FILENAME
+
+    @property
+    def global_agents_override_path(self) -> Path:
+        return self.path.parent / GLOBAL_AGENTS_OVERRIDE_FILENAME
+
+    @property
+    def global_instruction_paths(self) -> tuple[Path, Path]:
+        return self.global_agents_path, self.global_agents_override_path
+
+    @property
+    def active_global_instruction_path(self) -> Path:
+        override = self.global_agents_override_path
+        if override.exists() and override.read_text(encoding="utf-8").strip():
+            return override
+        return self.global_agents_path
+
+    @staticmethod
+    def _write_text_atomically(path: Path, text: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(
             prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
@@ -275,6 +293,41 @@ class ConfigStore:
         finally:
             if os.path.exists(temp_name):
                 os.remove(temp_name)
+
+    def _save_global_instruction_policy(self, settings: AgentSettings) -> None:
+        target = self.active_global_instruction_path
+        existing_target = (
+            target.read_text(encoding="utf-8") if target.exists() else ""
+        )
+
+        for path in self.global_instruction_paths:
+            if path == target or not path.exists():
+                continue
+            existing = path.read_text(encoding="utf-8")
+            cleaned = merge_dual_mode_policy(existing, False)
+            if cleaned != existing:
+                self._write_text_atomically(path, cleaned)
+
+        updated_target = merge_dual_mode_policy(
+            existing_target,
+            settings.agents_enabled,
+            settings.subagent_model,
+            settings.subagent_effort,
+        )
+        if settings.agents_enabled or updated_target != existing_target:
+            self._write_text_atomically(target, updated_target)
+
+    def _save_managed_executor(self, settings: AgentSettings) -> None:
+        path = self.managed_executor_path
+        text = build_managed_executor_agent(
+            settings.subagent_model, settings.subagent_effort
+        )
+        tomllib.loads(text)
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+            if MANAGED_EXECUTOR_AGENT_MARKER not in existing:
+                raise ValueError(f"执行代理文件已被用户占用：{path}")
+        self._write_text_atomically(path, text)
 
     def _remove_managed_executor(self) -> None:
         path = self.managed_executor_path
@@ -290,30 +343,26 @@ class ConfigStore:
         original_data: dict[str, object] = {}
         if original.strip():
             original_data = tomllib.loads(original)
-        developer_instructions = merge_dual_mode_policy(
-            original_data.get("developer_instructions"),
-            settings.agents_enabled,
-            settings.subagent_model,
-            settings.subagent_effort,
+        legacy_instructions = merge_dual_mode_policy(
+            original_data.get("developer_instructions"), False
         )
-        updated = update_toml_values(
-            original,
-            {
-                ("", "model"): settings.main_model,
-                ("", "model_reasoning_effort"): settings.main_effort,
-                ("", "developer_instructions"): developer_instructions,
-                ("agents", "enabled"): settings.agents_enabled,
-                ("agents", "default_subagent_model"): settings.subagent_model,
-                (
-                    "agents",
-                    "default_subagent_reasoning_effort",
-                ): settings.subagent_effort,
-                (
-                    "agents",
-                    "max_concurrent_threads_per_session",
-                ): settings.max_threads,
-            },
-        )
+        updates: dict[tuple[str, str], object] = {
+            ("", "model"): settings.main_model,
+            ("", "model_reasoning_effort"): settings.main_effort,
+            ("agents", "enabled"): settings.agents_enabled,
+            ("agents", "default_subagent_model"): settings.subagent_model,
+            (
+                "agents",
+                "default_subagent_reasoning_effort",
+            ): settings.subagent_effort,
+            (
+                "agents",
+                "max_concurrent_threads_per_session",
+            ): settings.max_threads,
+        }
+        if "developer_instructions" in original_data or legacy_instructions:
+            updates[("", "developer_instructions")] = legacy_instructions
+        updated = update_toml_values(original, updates)
         tomllib.loads(updated)
 
         if settings.agents_enabled:
@@ -336,6 +385,7 @@ class ConfigStore:
         finally:
             if os.path.exists(temp_name):
                 os.remove(temp_name)
+        self._save_global_instruction_policy(settings)
         return backup
 
 
@@ -2124,7 +2174,7 @@ class CodexAgentConsole:
 
         ttk.Label(
             parent,
-            text="简单任务由子模型全程执行；复杂任务由主模型规划、整合和审查。保存后重启 Codex Desktop，再新建任务生效。",
+            text="简单任务（含写作、编码等）由子模型全程执行；复杂任务由主模型规划、整合和审查。策略写入全局 AGENTS.md，重启 Codex 后新任务生效。",
             style="Muted.TLabel",
         ).grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
@@ -2282,7 +2332,7 @@ class CodexAgentConsole:
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"保存失败：{exc}")
             return False
-        mode = "双模型协调策略已写入" if settings.agents_enabled else "普通模式已恢复"
+        mode = "全局 AGENTS 双模型策略已写入" if settings.agents_enabled else "普通模式已恢复"
         self.status_var.set(f"已保存 · {mode} · 重启 Codex 后新任务生效")
         return True
 

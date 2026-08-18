@@ -122,6 +122,8 @@ class ConfigStoreTests(unittest.TestCase):
                 'developer_instructions = "Keep my existing instruction."\n',
                 encoding="utf-8",
             )
+            agents = Path(temp) / "AGENTS.md"
+            agents.write_text("Keep my global instruction.\n", encoding="utf-8")
             store = ConfigStore(config)
             dual = AgentSettings(
                 "gpt-5.6-sol", "high", "gpt-5.6-terra", "medium", True, 4
@@ -129,13 +131,16 @@ class ConfigStoreTests(unittest.TestCase):
             store.save(dual)
             store.save(dual)
             enabled_data = tomllib.loads(config.read_text(encoding="utf-8"))
-            enabled_instructions = enabled_data["developer_instructions"]
+            enabled_instructions = agents.read_text(encoding="utf-8")
             self.assertEqual(enabled_instructions.count(DUAL_MODE_POLICY_START), 1)
-            self.assertIn("Keep my existing instruction.", enabled_instructions)
+            self.assertIn("Keep my global instruction.", enabled_instructions)
             self.assertIn("model `gpt-5.6-terra`", enabled_instructions)
             self.assertIn("reasoning effort `medium`", enabled_instructions)
             self.assertTrue(has_dual_mode_policy(enabled_instructions))
             self.assertTrue(store.load().agents_enabled)
+            self.assertEqual(
+                enabled_data["developer_instructions"], "Keep my existing instruction."
+            )
 
             store.save(
                 AgentSettings(
@@ -152,8 +157,53 @@ class ConfigStoreTests(unittest.TestCase):
                 disabled_data["developer_instructions"],
                 "Keep my existing instruction.",
             )
+            self.assertEqual(agents.read_text(encoding="utf-8"), "Keep my global instruction.")
             self.assertFalse(disabled_data["agents"]["enabled"])
             self.assertFalse(store.load().agents_enabled)
+
+    def test_prefers_nonempty_global_agents_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.toml"
+            agents = Path(temp) / "AGENTS.md"
+            override = Path(temp) / "AGENTS.override.md"
+            agents.write_text("Base global guidance.", encoding="utf-8")
+            override.write_text("Temporary global guidance.", encoding="utf-8")
+            store = ConfigStore(config)
+            settings = AgentSettings(
+                "gpt-5.6-sol", "high", "gpt-5.6-luna", "xhigh", True, 4
+            )
+
+            store.save(settings)
+
+            self.assertFalse(has_dual_mode_policy(agents.read_text(encoding="utf-8")))
+            self.assertTrue(has_dual_mode_policy(override.read_text(encoding="utf-8")))
+            self.assertEqual(store.active_global_instruction_path, override)
+
+    def test_nonempty_override_masks_policy_in_global_agents_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.toml"
+            store = ConfigStore(config)
+            settings = AgentSettings(
+                "gpt-5.6-sol", "high", "gpt-5.6-luna", "xhigh", True, 4
+            )
+            store.save(settings)
+            store.global_agents_override_path.write_text(
+                "Temporary guidance without the console policy.", encoding="utf-8"
+            )
+
+            self.assertFalse(store.load().agents_enabled)
+
+    def test_load_accepts_legacy_policy_before_first_migration_save(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.toml"
+            legacy = merge_dual_mode_policy(
+                "Legacy user instruction.", True, "gpt-5.6-luna", "xhigh"
+            )
+            config.write_text(
+                'developer_instructions = ' + json.dumps(legacy) + '\n[agents]\nenabled = true\n',
+                encoding="utf-8",
+            )
+            self.assertTrue(ConfigStore(config).load().agents_enabled)
 
     def test_policy_merge_handles_empty_and_unmanaged_instructions(self):
         enabled = merge_dual_mode_policy(None, True, "gpt-5.6-terra", "medium")
@@ -163,18 +213,22 @@ class ConfigStoreTests(unittest.TestCase):
     def test_dual_mode_policy_routes_simple_work_to_complete_subagent(self):
         policy = build_dual_mode_policy("gpt-5.6-terra", "low")
         self.assertIn(
-            "Simple execution work is a clear, bounded, low-risk task",
+            "Treat every clear, bounded, low-risk, non-conversational user request as simple work",
             policy,
         )
+        self.assertIn("including coding, writing, rewriting, translation", policy)
         self.assertIn("exactly one custom execution subagent", policy)
         self.assertIn(MANAGED_EXECUTOR_AGENT_NAME, policy)
         self.assertIn("That subagent owns planning, tool use, implementation, testing", policy)
-        self.assertIn("do not plan, decompose, inspect, implement, or test in the primary agent", policy)
+        self.assertIn(
+            "do not plan, decompose, inspect, implement, test, or produce the requested result in the primary agent",
+            policy,
+        )
         self.assertIn(
             "For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning",
             policy,
         )
-        self.assertIn("report the blocker instead of silently taking over the work", policy)
+        self.assertIn("report the blocker instead of silently taking over the task", policy)
         self.assertIn("model `gpt-5.6-terra`", policy)
         self.assertIn("reasoning effort `low`", policy)
         self.assertNotIn("For every task that requires work", policy)

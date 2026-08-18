@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.5 - 2026-08-18
+
+- Move dual-model routing from `config.toml` developer instructions to the documented global `~/.codex/AGENTS.md` instruction chain, using a non-empty `AGENTS.override.md` when it is active.
+- Preserve user-authored global guidance while adding or removing only the console-owned policy block.
+- Route clear, low-risk writing and transformation tasks to the execution subagent as well as coding tasks.
+- Migrate and remove the ineffective legacy policy block from `developer_instructions` on the next save.
+
 ## 1.3.0 - 2026-08-18
 
 - Add Chat Completions, Responses API, and legacy Completions endpoint types.
