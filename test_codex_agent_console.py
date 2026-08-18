@@ -137,19 +137,23 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertTrue(has_dual_mode_policy(enabled))
         self.assertEqual(merge_dual_mode_policy(enabled, False), "")
 
-    def test_dual_mode_policy_dispatches_complete_work_to_one_subagent(self):
+    def test_dual_mode_policy_routes_simple_work_to_complete_subagent(self):
         policy = build_dual_mode_policy("gpt-5.6-terra", "low")
         self.assertIn(
-            "Act as a thin dispatcher",
+            "Simple execution work is a clear, bounded, low-risk task",
             policy,
         )
         self.assertIn("exactly one execution subagent", policy)
-        self.assertIn("The subagent owns planning, tool use, implementation, testing", policy)
+        self.assertIn("That subagent owns planning, tool use, implementation, testing", policy)
         self.assertIn("do not plan, decompose, inspect, implement, or test in the primary agent", policy)
+        self.assertIn(
+            "For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning",
+            policy,
+        )
         self.assertIn("report the blocker instead of silently taking over the work", policy)
         self.assertIn("model to `gpt-5.6-terra`", policy)
         self.assertIn("reasoning_effort to `low`", policy)
-        self.assertNotIn("use the primary agent for planning", policy)
+        self.assertNotIn("For every task that requires work", policy)
 
 
 class SessionStatsTests(unittest.TestCase):

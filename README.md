@@ -2,7 +2,7 @@
 
 一个非官方的 Codex Windows 桌面控制台，用于管理主模型、子代理默认值和双模型协调策略，并查看本机 Token 与缓存命中统计。
 
-当前版本：`1.3.2`
+当前版本：`1.3.3`
 
 > 本项目是社区工具，不是 OpenAI 官方产品。它只修改 Codex 官方支持的本地配置项。
 
@@ -15,7 +15,7 @@
 - 主模型：`model`、`model_reasoning_effort`
 - 子代理：`agents.default_subagent_model`、`agents.default_subagent_reasoning_effort`
 - 模式：`agents.enabled = true|false`
-- 双模型协调策略：启用时通过 `developer_instructions` 将完整任务直接交给一个子模型；子模型负责规划、执行、测试和完整结果，主模型只负责转交、等待和转述，并在派发子代理时显式传入 GUI 选择的模型和思考级别
+- 双模型协调策略：启用时通过 `developer_instructions` 将简单、明确、低风险的执行直接交给一个子模型全程完成；复杂、模糊、多步骤或跨模块工作仍由主模型规划、拆解、整合和审查，并在派发子代理时显式传入 GUI 选择的模型和思考级别
 - 一键按钮：“启用双模型”与“恢复普通模式”
 - 并发：`agents.max_concurrent_threads_per_session`
 - 统计：主任务与子代理分别显示输入、缓存输入、输出、推理输出、总 Token、缓存命中率，以及会话实际使用的模型/思考级别
