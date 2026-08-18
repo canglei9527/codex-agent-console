@@ -9,10 +9,16 @@ from pathlib import Path
 from codex_agent_console import (
     AgentSettings,
     ConfigStore,
+    DiagnosticResult,
     DUAL_MODE_POLICY_START,
+    SessionTokenTail,
     SessionStatsReader,
+    classify_diagnostic_error,
+    find_codex_executable,
     has_dual_mode_policy,
     merge_dual_mode_policy,
+    parse_codex_json_event,
+    summarize_diagnostics,
     update_toml_values,
 )
 
@@ -189,6 +195,107 @@ class SessionStatsTests(unittest.TestCase):
             self.assertEqual(sub.cache_hit_rate, 50.0)
             self.assertEqual(sub.models, {"gpt-5.6-terra/medium": 1})
             self.assertEqual(sub.latest_model, "gpt-5.6-terra/medium")
+
+
+class DiagnosticLogicTests(unittest.TestCase):
+    def test_parses_codex_json_lifecycle_and_usage(self):
+        self.assertEqual(
+            parse_codex_json_event(
+                {"type": "thread.started", "thread_id": "thread-123"}
+            ),
+            {"thread_id": "thread-123"},
+        )
+        self.assertTrue(
+            parse_codex_json_event(
+                {
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "API_OK"},
+                }
+            )["first_response"]
+        )
+        completed = parse_codex_json_event(
+            {
+                "type": "turn.completed",
+                "usage": {
+                    "input_tokens": 100,
+                    "cached_input_tokens": 60,
+                    "output_tokens": 8,
+                },
+            }
+        )
+        self.assertTrue(completed["completed"])
+        self.assertEqual(completed["usage"]["cached_input_tokens"], 60)
+
+    def test_classifies_common_api_and_transport_errors(self):
+        cases = {
+            "HTTP 401 Unauthorized": "401 认证失败",
+            "model alpha returned 404 not found": "404 模型不可用",
+            "429 Too Many Requests": "429 请求受限",
+            "request timed out": "请求超时",
+            "TLS connection failed": "网络错误",
+            "unexpected CLI exit": "CLI 失败",
+        }
+        for message, expected in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(classify_diagnostic_error(message), expected)
+
+    def test_summarizes_success_latency_and_output_speed(self):
+        results = [
+            DiagnosticResult(
+                "主模型", "a", "high", 1, True, "成功", 1.0, 3.0,
+                output_tokens=20, tokens_per_second=10.0,
+            ),
+            DiagnosticResult(
+                "子代理", "b", "medium", 1, False, "请求超时", None, 5.0,
+            ),
+        ]
+        summary = summarize_diagnostics(results)
+        self.assertEqual(summary.total, 2)
+        self.assertEqual(summary.succeeded, 1)
+        self.assertEqual(summary.success_rate, 50.0)
+        self.assertEqual(summary.average_first_response, 1.0)
+        self.assertEqual(summary.average_total_time, 4.0)
+        self.assertEqual(summary.average_tokens_per_second, 10.0)
+
+    def test_finds_bundled_codex_executable_before_path(self):
+        with tempfile.TemporaryDirectory() as temp:
+            local = Path(temp)
+            executable = local / "OpenAI" / "Codex" / "bin" / "version" / "codex.exe"
+            executable.parent.mkdir(parents=True)
+            executable.touch()
+            found = find_codex_executable(local, lambda _name: None)
+            self.assertEqual(found, executable)
+
+    def test_tails_cumulative_token_events_incrementally(self):
+        with tempfile.TemporaryDirectory() as temp:
+            session = Path(temp) / "session.jsonl"
+
+            def token_line(input_tokens: int, cached: int, output: int) -> str:
+                return json.dumps(
+                    {
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "total_token_usage": {
+                                    "input_tokens": input_tokens,
+                                    "cached_input_tokens": cached,
+                                    "output_tokens": output,
+                                }
+                            },
+                        },
+                    }
+                ) + "\n"
+
+            session.write_text(token_line(100, 50, 2), encoding="utf-8")
+            tail = SessionTokenTail(session)
+            self.assertEqual(tail.read_latest()["output_tokens"], 2)
+            with session.open("a", encoding="utf-8") as handle:
+                handle.write(token_line(100, 50, 12))
+            latest = tail.read_latest()
+            self.assertEqual(latest["input_tokens"], 100)
+            self.assertEqual(latest["cached_input_tokens"], 50)
+            self.assertEqual(latest["output_tokens"], 12)
 
 
 if __name__ == "__main__":
