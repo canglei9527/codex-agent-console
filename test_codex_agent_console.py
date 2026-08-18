@@ -17,12 +17,16 @@ from codex_agent_console import (
     CustomApiEndpoint,
     CustomApiResult,
     CustomApiStore,
+    CUSTOM_API_PROMPT,
     DiagnosticResult,
     DUAL_MODE_POLICY_START,
     SessionTokenTail,
     SessionStatsReader,
+    custom_api_base_url,
+    custom_api_endpoint_url,
     choose_custom_api_winners,
     classify_diagnostic_error,
+    fetch_custom_api_models,
     find_codex_executable,
     has_dual_mode_policy,
     merge_dual_mode_policy,
@@ -326,6 +330,57 @@ class DiagnosticLogicTests(unittest.TestCase):
 
 
 class CustomApiTests(unittest.TestCase):
+    def test_base_url_builds_supported_api_paths(self):
+        base = "https://api.example.com/v1"
+        self.assertEqual(
+            custom_api_base_url("https://api.example.com/v1/chat/completions"),
+            base,
+        )
+        self.assertEqual(custom_api_endpoint_url(base), f"{base}/chat/completions")
+        self.assertEqual(
+            custom_api_endpoint_url(base, "responses"), f"{base}/responses"
+        )
+        self.assertEqual(
+            custom_api_endpoint_url("https://api.example.com", "completions"),
+            "https://api.example.com/v1/completions",
+        )
+
+    def test_fetch_models_uses_models_endpoint_and_auth(self):
+        class Handler(BaseHTTPRequestHandler):
+            authorization = ""
+            path = ""
+
+            def do_GET(self):
+                Handler.authorization = self.headers.get("Authorization", "")
+                Handler.path = self.path
+                body = json.dumps(
+                    {"data": [{"id": "alpha"}, {"id": "beta"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            models = fetch_custom_api_models(
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "bearer",
+                "test-model-key",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(Handler.path, "/v1/models")
+        self.assertEqual(Handler.authorization, "Bearer test-model-key")
+        self.assertEqual(models, ["alpha", "beta"])
+
     @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI only")
     def test_dpapi_round_trip_and_store_does_not_write_plaintext_key(self):
         secret = "temporary-test-key-not-a-real-credential"
@@ -444,6 +499,63 @@ class CustomApiTests(unittest.TestCase):
         self.assertEqual(results[0].output_tokens, 2)
         self.assertFalse(results[0].tokens_estimated)
         self.assertIsNotNone(results[0].first_response_seconds)
+
+    def test_responses_streaming_benchmark_parses_response_events(self):
+        class Handler(BaseHTTPRequestHandler):
+            payload = {}
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                Handler.payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunks = (
+                    b"event: response.created\n\n"
+                    b'data: {"type":"response.created"}\n\n',
+                    b"event: response.output_text.delta\n\n"
+                    b'data: {"type":"response.output_text.delta","delta":"API"}\n\n',
+                    b"event: response.output_text.delta\n\n"
+                    b'data: {"type":"response.output_text.delta","delta":"_OK"}\n\n',
+                    b"event: response.completed\n\n"
+                    b'data: {"type":"response.completed","response":{"usage":{"output_tokens":2}}}\n\n',
+                )
+                for chunk in chunks:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = CustomApiEndpoint(
+                "responses",
+                "Responses",
+                f"http://127.0.0.1:{server.server_port}/v1/responses",
+                "response-model",
+                api_type="responses",
+            )
+            results: list[CustomApiResult] = []
+            CustomApiBenchmarkRunner().run(
+                [(endpoint, "")],
+                1,
+                10.0,
+                lambda _event: None,
+                results.append,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(Handler.payload["input"], CUSTOM_API_PROMPT)
+        self.assertNotIn("messages", Handler.payload)
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].api_type, "responses")
+        self.assertEqual(results[0].output_tokens, 2)
+        self.assertFalse(results[0].tokens_estimated)
 
 
 if __name__ == "__main__":

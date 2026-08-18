@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -40,7 +40,20 @@ DIAGNOSTIC_PROMPT = (
 )
 CUSTOM_API_CONFIG_NAME = "codex-agent-console-apis.json"
 CUSTOM_API_PROMPT = "Reply with exactly API_OK and nothing else."
+CUSTOM_API_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+CUSTOM_API_MODELS_SUFFIX = "/models"
 CUSTOM_API_AUTH_MODES = ("bearer", "x-api-key", "none")
+CUSTOM_API_TYPES = ("chat_completions", "responses", "completions")
+CUSTOM_API_TYPE_LABELS = {
+    "chat_completions": "Chat Completions",
+    "responses": "Responses API",
+    "completions": "Legacy Completions",
+}
+CUSTOM_API_TYPE_SUFFIXES = {
+    "chat_completions": CUSTOM_API_CHAT_COMPLETIONS_SUFFIX,
+    "responses": "/responses",
+    "completions": "/completions",
+}
 MODELS = (
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -1035,6 +1048,7 @@ class CustomApiEndpoint:
     auth_mode: str = "bearer"
     encrypted_api_key: str = ""
     selected: bool = True
+    api_type: str = "chat_completions"
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1045,6 +1059,7 @@ class CustomApiEndpoint:
             "auth_mode": self.auth_mode,
             "encrypted_api_key": self.encrypted_api_key,
             "selected": self.selected,
+            "api_type": self.api_type,
         }
 
     @classmethod
@@ -1056,10 +1071,13 @@ class CustomApiEndpoint:
         url = str(value.get("url") or "").strip()
         model = str(value.get("model") or "").strip()
         auth_mode = str(value.get("auth_mode") or "bearer").strip()
+        api_type = str(value.get("api_type") or "chat_completions").strip()
         if not endpoint_id or not name or not url or not model:
             return None
         if auth_mode not in CUSTOM_API_AUTH_MODES:
             auth_mode = "bearer"
+        if api_type not in CUSTOM_API_TYPES:
+            api_type = "chat_completions"
         return cls(
             endpoint_id=endpoint_id,
             name=name,
@@ -1068,7 +1086,65 @@ class CustomApiEndpoint:
             auth_mode=auth_mode,
             encrypted_api_key=str(value.get("encrypted_api_key") or ""),
             selected=bool(value.get("selected", True)),
+            api_type=api_type,
         )
+
+
+def custom_api_base_url(value: str) -> str:
+    """Return the editable base URL for a stored endpoint or user input."""
+    normalized = value.strip().rstrip("/")
+    for suffix in CUSTOM_API_TYPE_SUFFIXES.values():
+        if normalized.casefold().endswith(suffix):
+            normalized = normalized[: -len(suffix)].rstrip("/")
+            break
+    return normalized
+
+
+def custom_api_endpoint_url(value: str, api_type: str = "chat_completions") -> str:
+    """Build an API endpoint URL from a provider base URL."""
+    if api_type not in CUSTOM_API_TYPES:
+        raise ValueError("不支持的接口类型")
+    base = custom_api_base_url(value)
+    parsed = urllib.parse.urlsplit(base)
+    path = parsed.path.rstrip("/")
+    suffix = CUSTOM_API_TYPE_SUFFIXES[api_type]
+    if path.casefold().endswith("/v1"):
+        path += suffix
+    else:
+        path += "/v1" + suffix
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+    )
+
+
+def custom_api_models_url(value: str) -> str:
+    """Build the conventional OpenAI-compatible models URL."""
+    base = custom_api_base_url(value)
+    parsed = urllib.parse.urlsplit(base)
+    path = parsed.path.rstrip("/")
+    if path.casefold().endswith("/v1"):
+        path += CUSTOM_API_MODELS_SUFFIX
+    else:
+        path += "/v1" + CUSTOM_API_MODELS_SUFFIX
+    return urllib.parse.urlunsplit(
+        (parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment)
+    )
+
+
+def validate_custom_api_url(url: str) -> None:
+    parsed = urllib.parse.urlsplit(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("请输入基础 URL，例如 https://api.example.com/v1")
+    if parsed.username or parsed.password:
+        raise ValueError("URL 中不能包含用户名或密码")
+    hostname = (parsed.hostname or "").casefold()
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and hostname not in local_hosts:
+        raise ValueError("远程 API 必须使用 HTTPS，避免 API Key 明文传输")
+
+
+def custom_api_type_label(api_type: str) -> str:
+    return CUSTOM_API_TYPE_LABELS.get(api_type, api_type)
 
 
 def validate_custom_api_endpoint(endpoint: CustomApiEndpoint) -> None:
@@ -1078,15 +1154,9 @@ def validate_custom_api_endpoint(endpoint: CustomApiEndpoint) -> None:
         raise ValueError("模型不能为空")
     if endpoint.auth_mode not in CUSTOM_API_AUTH_MODES:
         raise ValueError("不支持的鉴权方式")
-    parsed = urllib.parse.urlsplit(endpoint.url.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("请输入完整的 HTTP 或 HTTPS URL")
-    if parsed.username or parsed.password:
-        raise ValueError("URL 中不能包含用户名或密码")
-    hostname = (parsed.hostname or "").casefold()
-    local_hosts = {"localhost", "127.0.0.1", "::1"}
-    if parsed.scheme != "https" and hostname not in local_hosts:
-        raise ValueError("远程 API 必须使用 HTTPS，避免 API Key 明文传输")
+    if endpoint.api_type not in CUSTOM_API_TYPES:
+        raise ValueError("不支持的接口类型")
+    validate_custom_api_url(endpoint.url)
 
 
 class CustomApiStore:
@@ -1150,6 +1220,7 @@ class CustomApiResult:
     tokens_estimated: bool = False
     tokens_per_second: float = 0.0
     error: str = ""
+    api_type: str = "chat_completions"
 
 
 @dataclass(frozen=True)
@@ -1164,6 +1235,7 @@ class CustomApiSummary:
     average_total_time: float | None
     jitter_percent: float | None
     average_tokens_per_second: float | None
+    api_type: str = "chat_completions"
 
 
 def summarize_custom_apis(
@@ -1223,6 +1295,7 @@ def summarize_custom_apis(
                     if speed_values
                     else None
                 ),
+                api_type=sample.api_type,
             )
         )
     return summaries
@@ -1257,8 +1330,39 @@ def choose_custom_api_winners(
     return fastest, stable
 
 
-def _extract_custom_api_content(value: object) -> str:
+def _extract_custom_api_content(
+    value: object, api_type: str = "chat_completions"
+) -> str:
     if not isinstance(value, dict):
+        return ""
+    if api_type == "responses":
+        event_type = value.get("type")
+        if event_type == "response.output_text.delta":
+            return str(value.get("delta") or "")
+        if event_type == "response.output_text.done":
+            return str(value.get("text") or "")
+        output_text = value.get("output_text")
+        if isinstance(output_text, str):
+            return output_text
+        response = value.get("response")
+        if isinstance(response, dict):
+            output_text = response.get("output_text")
+            if isinstance(output_text, str):
+                return output_text
+            value = response
+        output = value.get("output")
+        if isinstance(output, list):
+            parts: list[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                content = item.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        parts.append(part["text"])
+            return "".join(parts)
         return ""
     choices = value.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
@@ -1280,10 +1384,15 @@ def _extract_custom_api_content(value: object) -> str:
     return str(choice.get("text") or "")
 
 
-def _extract_custom_api_output_tokens(value: object) -> int:
+def _extract_custom_api_output_tokens(
+    value: object, api_type: str = "chat_completions"
+) -> int:
     if not isinstance(value, dict):
         return 0
     usage = value.get("usage")
+    if not isinstance(usage, dict) and api_type == "responses":
+        response = value.get("response")
+        usage = response.get("usage") if isinstance(response, dict) else None
     if not isinstance(usage, dict):
         return 0
     return _safe_token_count(
@@ -1304,6 +1413,79 @@ def _custom_api_error_status(message: str, http_status: int | None = None) -> st
     if http_status is not None:
         return f"HTTP {http_status}"
     return "请求失败"
+
+
+def _custom_api_auth_headers(auth_mode: str, api_key: str) -> dict[str, str]:
+    if auth_mode == "bearer":
+        return {"Authorization": f"Bearer {api_key}"}
+    if auth_mode == "x-api-key":
+        return {"x-api-key": api_key}
+    return {}
+
+
+def fetch_custom_api_models(
+    base_url: str,
+    auth_mode: str,
+    api_key: str,
+    timeout_seconds: float = 15.0,
+) -> list[str]:
+    """Fetch model IDs from an OpenAI-compatible /models endpoint."""
+    endpoint_url = custom_api_endpoint_url(base_url)
+    validate_custom_api_url(endpoint_url)
+    request = urllib.request.Request(
+        custom_api_models_url(base_url),
+        headers={
+            "Accept": "application/json",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            **_custom_api_auth_headers(auth_mode, api_key),
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(2048).decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        message = f"模型接口 HTTP {exc.code} {exc.reason}"
+        if detail:
+            message += f"：{detail}"
+        if api_key:
+            message = message.replace(api_key, "[REDACTED]")
+        raise ValueError(message) from exc
+    except urllib.error.URLError as exc:
+        raise ValueError(f"模型接口连接失败：{exc.reason}") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"模型接口返回无效：{exc}") from exc
+
+    if isinstance(payload, dict):
+        candidates = payload.get("data") or payload.get("models") or []
+    elif isinstance(payload, list):
+        candidates = payload
+    else:
+        candidates = []
+    if not isinstance(candidates, list):
+        candidates = [candidates]
+
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in candidates:
+        if isinstance(item, str):
+            model_id = item.strip()
+        elif isinstance(item, dict):
+            model_id = str(
+                item.get("id") or item.get("name") or item.get("model") or ""
+            ).strip()
+        else:
+            model_id = ""
+        if model_id and model_id not in seen:
+            models.append(model_id)
+            seen.add(model_id)
+    if not models:
+        raise ValueError("模型接口返回中没有可用模型")
+    return models
 
 
 class CustomApiBenchmarkRunner:
@@ -1357,6 +1539,7 @@ class CustomApiBenchmarkRunner:
                             error=str(exc).replace(api_key, "[REDACTED]")
                             if api_key
                             else str(exc),
+                            api_type=endpoint.api_type,
                         )
                     on_result(result)
         finally:
@@ -1372,26 +1555,34 @@ class CustomApiBenchmarkRunner:
         timeout_seconds: float,
         on_progress: Callable[[dict[str, object]], None],
     ) -> CustomApiResult:
-        payload = json.dumps(
-            {
+        if endpoint.api_type == "responses":
+            payload_value = {
+                "model": endpoint.model,
+                "input": CUSTOM_API_PROMPT,
+                "stream": True,
+            }
+        elif endpoint.api_type == "completions":
+            payload_value = {
+                "model": endpoint.model,
+                "prompt": CUSTOM_API_PROMPT,
+                "stream": True,
+            }
+        else:
+            payload_value = {
                 "model": endpoint.model,
                 "messages": [{"role": "user", "content": CUSTOM_API_PROMPT}],
                 "stream": True,
-            },
-            ensure_ascii=False,
-        ).encode("utf-8")
+            }
+        payload = json.dumps(payload_value, ensure_ascii=False).encode("utf-8")
         headers = {
             "Accept": "text/event-stream, application/json",
             "Content-Type": "application/json",
             "Connection": "close",
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
         }
-        if endpoint.auth_mode == "bearer":
-            headers["Authorization"] = f"Bearer {api_key}"
-        elif endpoint.auth_mode == "x-api-key":
-            headers["x-api-key"] = api_key
+        headers.update(_custom_api_auth_headers(endpoint.auth_mode, api_key))
         request = urllib.request.Request(
-            endpoint.url,
+            custom_api_endpoint_url(endpoint.url, endpoint.api_type),
             data=payload,
             headers=headers,
             method="POST",
@@ -1430,14 +1621,16 @@ class CustomApiBenchmarkRunner:
                         event = json.loads(data_text)
                     except json.JSONDecodeError:
                         continue
-                    content = _extract_custom_api_content(event)
+                    content = _extract_custom_api_content(event, endpoint.api_type)
                     if content:
                         output_parts.append(content)
                         content_events += 1
                     output_tokens = max(
                         output_tokens,
-                        _extract_custom_api_output_tokens(event),
+                        _extract_custom_api_output_tokens(event, endpoint.api_type),
                     )
+                elif line.startswith(("event:", "id:", "retry:")):
+                    continue
                 else:
                     plain_body.append(raw_line)
 
@@ -1460,13 +1653,13 @@ class CustomApiBenchmarkRunner:
             if plain_body:
                 body = b"".join(plain_body).decode("utf-8", errors="replace")
                 parsed = json.loads(body)
-                content = _extract_custom_api_content(parsed)
+                content = _extract_custom_api_content(parsed, endpoint.api_type)
                 if content:
                     output_parts.append(content)
                     content_events += 1
                 output_tokens = max(
                     output_tokens,
-                    _extract_custom_api_output_tokens(parsed),
+                    _extract_custom_api_output_tokens(parsed, endpoint.api_type),
                 )
             response.close()
             with self._response_lock:
@@ -1498,6 +1691,7 @@ class CustomApiBenchmarkRunner:
                 output_tokens=output_tokens,
                 tokens_estimated=estimated,
                 tokens_per_second=output_tokens / speed_seconds,
+                api_type=endpoint.api_type,
             )
         except urllib.error.HTTPError as exc:
             http_status = exc.code
@@ -1539,6 +1733,7 @@ class CustomApiBenchmarkRunner:
             first_response_seconds=first_response,
             total_seconds=total_seconds,
             error=message,
+            api_type=endpoint.api_type,
         )
 
 
@@ -1740,6 +1935,12 @@ class CodexAgentConsole:
             ],
             selectbackground=[("readonly", "#22272e")],
             selectforeground=[("readonly", "#ffffff")],
+        )
+        style.configure("TEntry", fieldbackground="#22272e", foreground="#ffffff")
+        style.map(
+            "TEntry",
+            fieldbackground=[("disabled", "#1c2128")],
+            foreground=[("disabled", "#7d8590")],
         )
         style.configure("TSpinbox", fieldbackground="#22272e", foreground="#ffffff")
         style.configure(
@@ -2808,7 +3009,10 @@ class CodexAgentConsole:
             self._custom_api_selection_vars[endpoint.endpoint_id] = selected
             check = ttk.Checkbutton(
                 row,
-                text=f"{endpoint.name} · {endpoint.model}",
+                text=(
+                    f"{endpoint.name} · {custom_api_type_label(endpoint.api_type)}"
+                    f" · {endpoint.model}"
+                ),
                 variable=selected,
                 style="Panel.TCheckbutton",
                 command=lambda eid=endpoint.endpoint_id: self._custom_api_selection_changed(eid),
@@ -2817,7 +3021,10 @@ class CodexAgentConsole:
             self._custom_api_checks.append(check)
             ttk.Label(
                 row,
-                text=f"{endpoint.url} · {self._custom_auth_label(endpoint.auth_mode)}",
+                text=(
+                    f"基础 URL：{custom_api_base_url(endpoint.url)} · "
+                    f"{self._custom_auth_label(endpoint.auth_mode)}"
+                ),
                 style="PanelMuted.TLabel",
                 wraplength=760,
                 justify="left",
@@ -2861,45 +3068,133 @@ class CodexAgentConsole:
     def _open_custom_api_editor(self, endpoint: CustomApiEndpoint | None) -> None:
         editor = tk.Toplevel(self._custom_api_window)
         editor.title("编辑自定义 API" if endpoint else "新增自定义 API")
-        editor.geometry("660x430")
-        editor.minsize(580, 380)
+        editor.geometry("700x520")
+        editor.minsize(620, 450)
         editor.configure(bg="#111418")
         editor.transient(self._custom_api_window)
         editor.grab_set()
         panel = ttk.Frame(editor, style="Panel.TFrame", padding=18)
         panel.pack(fill="both", expand=True)
         panel.columnconfigure(1, weight=1)
+        panel.columnconfigure(2, weight=0)
 
         name_var = tk.StringVar(value=endpoint.name if endpoint else "")
-        url_var = tk.StringVar(value=endpoint.url if endpoint else "")
+        base_url_var = tk.StringVar(
+            value=custom_api_base_url(endpoint.url) if endpoint else ""
+        )
         model_var = tk.StringVar(value=endpoint.model if endpoint else "")
+        api_type_var = tk.StringVar(
+            value=custom_api_type_label(endpoint.api_type)
+            if endpoint
+            else custom_api_type_label("chat_completions")
+        )
         auth_var = tk.StringVar(
             value=self._custom_auth_label(endpoint.auth_mode)
             if endpoint
             else "Bearer"
         )
         key_var = tk.StringVar()
-        fields = (
-            ("名称", name_var),
-            ("完整 URL", url_var),
-            ("模型", model_var),
+        model_status_var = tk.StringVar(
+            value="填好基础 URL 和 Key 后点击“获取模型”。"
         )
+
+        fields = (("名称", name_var), ("基础 URL", base_url_var))
         for row, (label, variable) in enumerate(fields):
             ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=8)
             entry = ttk.Entry(panel, textvariable=variable)
-            entry.grid(row=row, column=1, sticky="ew", pady=8)
-        ttk.Label(panel, text="鉴权方式").grid(row=3, column=0, sticky="w", pady=8)
+            entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=8)
+
+        ttk.Label(panel, text="接口类型").grid(row=2, column=0, sticky="w", pady=8)
+        api_type_combo = ttk.Combobox(
+            panel,
+            textvariable=api_type_var,
+            values=tuple(CUSTOM_API_TYPE_LABELS.values()),
+            state="readonly",
+        )
+        api_type_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=8)
+
+        ttk.Label(panel, text="模型").grid(row=3, column=0, sticky="w", pady=8)
+        model_combo = ttk.Combobox(
+            panel,
+            textvariable=model_var,
+            state="normal",
+        )
+        model_combo.grid(row=3, column=1, sticky="ew", pady=8)
+
+        ttk.Label(panel, text="鉴权方式").grid(row=4, column=0, sticky="w", pady=8)
         auth_combo = ttk.Combobox(
             panel,
             textvariable=auth_var,
             values=("Bearer", "x-api-key", "无鉴权"),
             state="readonly",
         )
-        auth_combo.grid(row=3, column=1, sticky="ew", pady=8)
-        ttk.Label(panel, text="API Key").grid(row=4, column=0, sticky="w", pady=8)
-        ttk.Entry(panel, textvariable=key_var, show="*").grid(
-            row=4, column=1, sticky="ew", pady=8
-        )
+        auth_combo.grid(row=4, column=1, columnspan=2, sticky="ew", pady=8)
+
+        ttk.Label(panel, text="API Key").grid(row=5, column=0, sticky="w", pady=8)
+        key_entry = ttk.Entry(panel, textvariable=key_var, show="*")
+        key_entry.grid(row=5, column=1, sticky="ew", pady=8)
+
+        def selected_auth_mode() -> str:
+            return {
+                "Bearer": "bearer",
+                "x-api-key": "x-api-key",
+                "无鉴权": "none",
+            }.get(auth_var.get(), "bearer")
+
+        def apply_models(models: list[str], error: str = "") -> None:
+            if not editor.winfo_exists():
+                return
+            fetch_button.configure(state="normal")
+            if error:
+                model_status_var.set(f"获取模型失败：{error}")
+                return
+            model_combo.configure(values=models)
+            if model_var.get().strip() not in models:
+                model_var.set(models[0])
+            model_status_var.set(f"已获取 {len(models)} 个模型，可从下拉框选择。")
+
+        def fetch_models() -> None:
+            auth_mode = selected_auth_mode()
+            base_url = base_url_var.get().strip()
+            api_key = key_var.get()
+            try:
+                validate_custom_api_url(custom_api_endpoint_url(base_url))
+                if auth_mode != "none" and not api_key and endpoint:
+                    api_key = unprotect_secret(endpoint.encrypted_api_key)
+                if auth_mode != "none" and not api_key:
+                    raise ValueError("请先填写 API Key")
+            except Exception as exc:
+                model_status_var.set(f"无法获取模型：{exc}")
+                return
+            fetch_button.configure(state="disabled")
+            model_status_var.set("正在获取模型列表…")
+
+            def worker() -> None:
+                try:
+                    models = fetch_custom_api_models(base_url, auth_mode, api_key)
+                    self.root.after(0, lambda: apply_models(models))
+                except Exception as exc:
+                    self.root.after(0, lambda: apply_models([], str(exc)))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        fetch_button = ttk.Button(panel, text="获取模型", command=fetch_models)
+        fetch_button.grid(row=3, column=2, padx=(8, 0), pady=8)
+
+        ttk.Label(
+            panel,
+            textvariable=model_status_var,
+            style="PanelMuted.TLabel",
+            wraplength=490,
+            justify="left",
+        ).grid(row=6, column=1, columnspan=2, sticky="w", pady=(0, 4))
+        ttk.Label(
+            panel,
+            text="基础 URL 例：https://api.example.com/v1；保存时会自动补全对应接口路径。",
+            style="PanelMuted.TLabel",
+            wraplength=540,
+            justify="left",
+        ).grid(row=7, column=1, columnspan=2, sticky="w", pady=(0, 8))
         ttk.Label(
             panel,
             text=(
@@ -2907,18 +3202,17 @@ class CodexAgentConsole:
                 "不会明文写入配置。"
             ),
             style="PanelMuted.TLabel",
-            wraplength=490,
+            wraplength=540,
             justify="left",
-        ).grid(row=5, column=1, sticky="w", pady=(0, 12))
+        ).grid(row=8, column=1, columnspan=2, sticky="w", pady=(0, 12))
         button_row = ttk.Frame(panel, style="Panel.TFrame")
-        button_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        button_row.grid(row=9, column=0, columnspan=3, sticky="e", pady=(8, 0))
 
         def save_editor() -> None:
-            auth_mode = {
-                "Bearer": "bearer",
-                "x-api-key": "x-api-key",
-                "无鉴权": "none",
-            }.get(auth_var.get(), "bearer")
+            auth_mode = selected_auth_mode()
+            api_type = {
+                label: key for key, label in CUSTOM_API_TYPE_LABELS.items()
+            }.get(api_type_var.get(), "chat_completions")
             existing_key = endpoint.encrypted_api_key if endpoint else ""
             key = key_var.get()
             if auth_mode == "none":
@@ -2931,14 +3225,20 @@ class CodexAgentConsole:
                     return
             else:
                 encrypted_key = existing_key
+            try:
+                endpoint_url = custom_api_endpoint_url(base_url_var.get(), api_type)
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=editor)
+                return
             candidate = CustomApiEndpoint(
                 endpoint_id=endpoint.endpoint_id if endpoint else uuid.uuid4().hex,
                 name=name_var.get().strip(),
-                url=url_var.get().strip(),
+                url=endpoint_url,
                 model=model_var.get().strip(),
                 auth_mode=auth_mode,
                 encrypted_api_key=encrypted_key,
                 selected=endpoint.selected if endpoint else True,
+                api_type=api_type,
             )
             try:
                 validate_custom_api_endpoint(candidate)
@@ -3126,7 +3426,7 @@ class CodexAgentConsole:
             "end",
             values=(
                 result.name,
-                result.model,
+                f"{custom_api_type_label(result.api_type)} · {result.model}",
                 result.attempt,
                 result.status,
                 result.http_status or "--",
@@ -3175,7 +3475,7 @@ class CodexAgentConsole:
                 "end",
                 values=(
                     summary.name,
-                    summary.model,
+                    f"{custom_api_type_label(summary.api_type)} · {summary.model}",
                     f"{summary.succeeded}/{summary.total} ({summary.success_rate:.0f}%)",
                     (
                         f"{summary.average_first_response:.2f}s"

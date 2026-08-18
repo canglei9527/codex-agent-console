@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.0 - 2026-08-18
+
+- Add Chat Completions, Responses API, and legacy Completions endpoint types.
+- Generate type-specific request bodies and parse Chat/Responses/Completions streaming events.
+- Replace the required full endpoint URL with a provider base URL and automatic path completion.
+- Add background model discovery through the OpenAI-compatible `/v1/models` endpoint.
+- Improve entry-field contrast so entered values remain readable in the dark UI.
+
 ## 1.2.0 - 2026-08-18
 
 - Add persistent multi-select benchmarking for OpenAI Chat Completions compatible APIs.

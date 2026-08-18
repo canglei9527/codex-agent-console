@@ -2,7 +2,7 @@
 
 一个非官方的 Codex Windows 桌面控制台，用于管理主模型、子代理默认值和双模型协调策略，并查看本机 Token 与缓存命中统计。
 
-当前版本：`1.2.0`
+当前版本：`1.3.0`
 
 > 本项目是社区工具，不是 OpenAI 官方产品。它只修改 Codex 官方支持的本地配置项。
 
@@ -22,7 +22,9 @@
 - API 诊断：可测试主模型、子代理或两者，支持 1/3/5 次采样与 10–600 秒超时
 - 诊断指标：连通成功率、首响应、API 总耗时、CLI 收尾耗时、输入/缓存/输出 Token 和 Tokens/s
 - 错误定位：区分 401 认证失败、404 模型不可用、429 请求受限、超时、网络错误和其他 CLI 故障，并保留每次请求的完整错误详情
-- 自定义 API：持久化保存多个 OpenAI Chat Completions 兼容接口，可勾选多个接口顺序测速
+- 自定义 API：持久化保存多个 OpenAI 兼容接口，可勾选多个接口顺序测速
+- 接口类型：支持 Chat Completions、Responses API 和 Legacy Completions，按类型生成请求体并解析流式事件
+- 基础 URL：只需填写例如 `https://api.example.com/v1`，自动补全具体接口路径；可从 `/v1/models` 自动获取模型
 - 自定义测速：比较成功率、平均首响应、平均总耗时、耗时波动和 Tokens/s，并标出最快与最稳定接口
 - API Key 安全：支持 Bearer、`x-api-key` 和无鉴权；Key 使用 Windows DPAPI 加密，不明文写入配置或显示在界面中
 
@@ -40,7 +42,7 @@ CLI 调用方式依据 [Codex CLI reference](https://developers.openai.com/codex
 
 Codex 官方订阅使用 ChatGPT 登录，不是可粘贴到 HTTP 接口中的 API Key。测试官方订阅时，点击主窗口的“API 诊断”，或在“自定义 API”窗口点击“测试 Codex 官方订阅”；程序会复用本机 Codex CLI 的现有登录状态。官方登录方式见 [Codex authentication](https://developers.openai.com/codex/auth/)。
 
-“自定义 API”用于独立购买的 OpenAI Platform API Key、第三方兼容 API 或自建服务。点击“新增 API”，填写名称、完整 Chat Completions URL、模型、鉴权方式和 Key；保存后勾选一个或多个 API，选择 1/3/5 次测试并点击“开始测速”。例如 OpenAI Platform 的完整 URL 为 `https://api.openai.com/v1/chat/completions`，其 API 用量和 Codex/ChatGPT 订阅分开计费。
+“自定义 API”用于独立购买的 OpenAI Platform API Key、第三方兼容 API 或自建服务。点击“新增 API”，填写名称、基础 URL、接口类型和鉴权方式；点击“获取模型”即可从兼容的 `/v1/models` 接口读取模型，再保存并测速。例如基础 URL 可以填写 `https://api.openai.com/v1`，程序会根据所选类型使用 `/chat/completions`、`/responses` 或 `/completions`。其 API 用量和 Codex/ChatGPT 订阅分开计费。
 
 默认执行 3 次以计算稳定性。测试按 API 顺序逐个执行，避免并发抢占本机带宽影响比较；每次都会产生对应服务的实际 Token 消耗。远程接口必须使用 HTTPS，只有 localhost 可使用 HTTP。
 

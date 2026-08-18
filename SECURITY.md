@@ -20,9 +20,12 @@ decrypts a selected key only in memory while constructing its benchmark
 request. Remote endpoints must use HTTPS, with HTTP allowed only for localhost.
 
 Custom API benchmarks send only the fixed connectivity prompt and the saved
-model name to the configured endpoint. They are real requests and consume that
-provider's API quota. Codex subscription diagnostics use the Codex CLI login;
-they do not expose or reuse subscription credentials as custom API keys.
+model name to the configured endpoint. The request format follows the selected
+Chat Completions, Responses, or legacy Completions type. Model discovery sends
+an authenticated GET request to the conventional `/v1/models` endpoint. These
+are real requests and consume that provider's API quota. Codex subscription
+diagnostics use the Codex CLI login; they do not expose or reuse subscription
+credentials as custom API keys.
 
 Before replacing `config.toml`, the application validates the TOML, creates a
 backup named `config.toml.codex-agent-console.bak`, and performs an atomic
