@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 - 2026-08-18
+
+- Add persistent multi-select benchmarking for OpenAI Chat Completions compatible APIs.
+- Add Bearer, `x-api-key`, and unauthenticated endpoint support with Windows DPAPI encrypted API keys.
+- Report success rate, first response, total latency, latency jitter, output Tokens, and Tokens/s.
+- Rank the fastest and most stable APIs with reliability taking priority over raw speed.
+- Add streaming SSE parsing, usage fallback estimation, cancellation, and detailed HTTP errors.
+- Link official Codex subscription testing to the existing Codex CLI diagnostics flow.
+- Clarify that ChatGPT subscription login and OpenAI Platform API keys are separate credentials.
+
 ## 1.1.0 - 2026-08-18
 
 - Add a standalone API diagnostics window for main and subagent models.

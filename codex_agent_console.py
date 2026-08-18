@@ -1,17 +1,27 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import base64
+import ctypes
 import json
+import math
 import os
 import queue
 import re
 import shutil
+import socket
+import statistics
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from ctypes import wintypes
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,13 +31,16 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
     "This is an API connectivity diagnostic. Do not use tools. "
     "Reply with exactly API_OK and nothing else."
 )
+CUSTOM_API_CONFIG_NAME = "codex-agent-console-apis.json"
+CUSTOM_API_PROMPT = "Reply with exactly API_OK and nothing else."
+CUSTOM_API_AUTH_MODES = ("bearer", "x-api-key", "none")
 MODELS = (
     "gpt-5.6-sol",
     "gpt-5.6-terra",
@@ -925,6 +938,610 @@ class CodexDiagnosticsRunner:
         )
 
 
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+def protect_secret(value: str) -> str:
+    if not value:
+        return ""
+    if sys.platform != "win32":
+        raise RuntimeError("API Key 加密保存仅支持 Windows")
+    raw = value.encode("utf-8")
+    buffer = ctypes.create_string_buffer(raw)
+    input_blob = _DataBlob(
+        len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    crypt32.CryptProtectData.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        wintypes.LPCWSTR,
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptProtectData.restype = wintypes.BOOL
+    if not crypt32.CryptProtectData(
+        ctypes.byref(input_blob),
+        "Codex Agent Console custom API",
+        None,
+        None,
+        None,
+        0x01,
+        ctypes.byref(output_blob),
+    ):
+        raise ctypes.WinError()
+    try:
+        encrypted = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+        return base64.b64encode(encrypted).decode("ascii")
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+def unprotect_secret(value: str) -> str:
+    if not value:
+        return ""
+    if sys.platform != "win32":
+        raise RuntimeError("API Key 解密仅支持 Windows")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("保存的 API Key 数据无效") from exc
+    buffer = ctypes.create_string_buffer(raw)
+    input_blob = _DataBlob(
+        len(raw), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
+    )
+    output_blob = _DataBlob()
+    crypt32 = ctypes.windll.crypt32
+    crypt32.CryptUnprotectData.argtypes = [
+        ctypes.POINTER(_DataBlob),
+        ctypes.POINTER(wintypes.LPWSTR),
+        ctypes.POINTER(_DataBlob),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(_DataBlob),
+    ]
+    crypt32.CryptUnprotectData.restype = wintypes.BOOL
+    if not crypt32.CryptUnprotectData(
+        ctypes.byref(input_blob),
+        None,
+        None,
+        None,
+        None,
+        0x01,
+        ctypes.byref(output_blob),
+    ):
+        raise ctypes.WinError()
+    try:
+        decrypted = ctypes.string_at(output_blob.pbData, output_blob.cbData)
+        return decrypted.decode("utf-8")
+    finally:
+        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+
+
+@dataclass
+class CustomApiEndpoint:
+    endpoint_id: str
+    name: str
+    url: str
+    model: str
+    auth_mode: str = "bearer"
+    encrypted_api_key: str = ""
+    selected: bool = True
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.endpoint_id,
+            "name": self.name,
+            "url": self.url,
+            "model": self.model,
+            "auth_mode": self.auth_mode,
+            "encrypted_api_key": self.encrypted_api_key,
+            "selected": self.selected,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> CustomApiEndpoint | None:
+        if not isinstance(value, dict):
+            return None
+        endpoint_id = str(value.get("id") or "").strip()
+        name = str(value.get("name") or "").strip()
+        url = str(value.get("url") or "").strip()
+        model = str(value.get("model") or "").strip()
+        auth_mode = str(value.get("auth_mode") or "bearer").strip()
+        if not endpoint_id or not name or not url or not model:
+            return None
+        if auth_mode not in CUSTOM_API_AUTH_MODES:
+            auth_mode = "bearer"
+        return cls(
+            endpoint_id=endpoint_id,
+            name=name,
+            url=url,
+            model=model,
+            auth_mode=auth_mode,
+            encrypted_api_key=str(value.get("encrypted_api_key") or ""),
+            selected=bool(value.get("selected", True)),
+        )
+
+
+def validate_custom_api_endpoint(endpoint: CustomApiEndpoint) -> None:
+    if not endpoint.name.strip():
+        raise ValueError("API 名称不能为空")
+    if not endpoint.model.strip():
+        raise ValueError("模型不能为空")
+    if endpoint.auth_mode not in CUSTOM_API_AUTH_MODES:
+        raise ValueError("不支持的鉴权方式")
+    parsed = urllib.parse.urlsplit(endpoint.url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError("请输入完整的 HTTP 或 HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ValueError("URL 中不能包含用户名或密码")
+    hostname = (parsed.hostname or "").casefold()
+    local_hosts = {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme != "https" and hostname not in local_hosts:
+        raise ValueError("远程 API 必须使用 HTTPS，避免 API Key 明文传输")
+
+
+class CustomApiStore:
+    def __init__(self, path: Path):
+        self.path = path
+
+    def load(self) -> list[CustomApiEndpoint]:
+        if not self.path.exists():
+            return []
+        data = json.loads(self.path.read_text(encoding="utf-8"))
+        entries = data.get("endpoints") if isinstance(data, dict) else None
+        if not isinstance(entries, list):
+            return []
+        endpoints: list[CustomApiEndpoint] = []
+        seen: set[str] = set()
+        for entry in entries:
+            endpoint = CustomApiEndpoint.from_dict(entry)
+            if endpoint is None or endpoint.endpoint_id in seen:
+                continue
+            validate_custom_api_endpoint(endpoint)
+            endpoints.append(endpoint)
+            seen.add(endpoint.endpoint_id)
+        return endpoints
+
+    def save(self, endpoints: list[CustomApiEndpoint]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "endpoints": [endpoint.to_dict() for endpoint in endpoints],
+        }
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        backup = self.path.with_name(self.path.name + ".bak")
+        if self.path.exists():
+            shutil.copy2(self.path, backup)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=self.path.name + ".", suffix=".tmp", dir=str(self.path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, self.path)
+        finally:
+            if os.path.exists(temp_name):
+                os.remove(temp_name)
+
+
+@dataclass(frozen=True)
+class CustomApiResult:
+    endpoint_id: str
+    name: str
+    model: str
+    attempt: int
+    success: bool
+    status: str
+    http_status: int | None
+    first_response_seconds: float | None
+    total_seconds: float
+    output_tokens: int = 0
+    tokens_estimated: bool = False
+    tokens_per_second: float = 0.0
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class CustomApiSummary:
+    endpoint_id: str
+    name: str
+    model: str
+    total: int
+    succeeded: int
+    success_rate: float
+    average_first_response: float | None
+    average_total_time: float | None
+    jitter_percent: float | None
+    average_tokens_per_second: float | None
+
+
+def summarize_custom_apis(
+    results: list[CustomApiResult],
+) -> list[CustomApiSummary]:
+    grouped: dict[str, list[CustomApiResult]] = {}
+    order: list[str] = []
+    for result in results:
+        if result.endpoint_id not in grouped:
+            grouped[result.endpoint_id] = []
+            order.append(result.endpoint_id)
+        grouped[result.endpoint_id].append(result)
+
+    summaries: list[CustomApiSummary] = []
+    for endpoint_id in order:
+        endpoint_results = grouped[endpoint_id]
+        successes = [result for result in endpoint_results if result.success]
+        first_values = [
+            result.first_response_seconds
+            for result in successes
+            if result.first_response_seconds is not None
+        ]
+        total_values = [result.total_seconds for result in successes]
+        speed_values = [
+            result.tokens_per_second
+            for result in successes
+            if result.output_tokens > 0
+        ]
+        average_total = (
+            sum(total_values) / len(total_values) if total_values else None
+        )
+        jitter = None
+        if len(total_values) >= 2 and average_total:
+            jitter = statistics.pstdev(total_values) * 100.0 / average_total
+        sample = endpoint_results[0]
+        summaries.append(
+            CustomApiSummary(
+                endpoint_id=endpoint_id,
+                name=sample.name,
+                model=sample.model,
+                total=len(endpoint_results),
+                succeeded=len(successes),
+                success_rate=(
+                    len(successes) * 100.0 / len(endpoint_results)
+                    if endpoint_results
+                    else 0.0
+                ),
+                average_first_response=(
+                    sum(first_values) / len(first_values)
+                    if first_values
+                    else None
+                ),
+                average_total_time=average_total,
+                jitter_percent=jitter,
+                average_tokens_per_second=(
+                    sum(speed_values) / len(speed_values)
+                    if speed_values
+                    else None
+                ),
+            )
+        )
+    return summaries
+
+
+def choose_custom_api_winners(
+    summaries: list[CustomApiSummary],
+) -> tuple[CustomApiSummary | None, CustomApiSummary | None]:
+    usable = [
+        summary
+        for summary in summaries
+        if summary.average_total_time is not None and summary.succeeded > 0
+    ]
+    if not usable:
+        return None, None
+    fastest = min(
+        usable,
+        key=lambda summary: (
+            -summary.success_rate,
+            summary.average_total_time or math.inf,
+            summary.jitter_percent if summary.jitter_percent is not None else math.inf,
+        ),
+    )
+    stable = min(
+        usable,
+        key=lambda summary: (
+            -summary.success_rate,
+            summary.jitter_percent if summary.jitter_percent is not None else math.inf,
+            summary.average_total_time or math.inf,
+        ),
+    )
+    return fastest, stable
+
+
+def _extract_custom_api_content(value: object) -> str:
+    if not isinstance(value, dict):
+        return ""
+    choices = value.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        return ""
+    choice = choices[0]
+    source = choice.get("delta")
+    if not isinstance(source, dict):
+        source = choice.get("message")
+    if isinstance(source, dict):
+        content = source.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+            return "".join(parts)
+    return str(choice.get("text") or "")
+
+
+def _extract_custom_api_output_tokens(value: object) -> int:
+    if not isinstance(value, dict):
+        return 0
+    usage = value.get("usage")
+    if not isinstance(usage, dict):
+        return 0
+    return _safe_token_count(
+        usage.get("completion_tokens") or usage.get("output_tokens")
+    )
+
+
+def _estimated_token_count(text: str) -> int:
+    if not text:
+        return 0
+    return max(1, math.ceil(len(text.encode("utf-8")) / 4.0))
+
+
+def _custom_api_error_status(message: str, http_status: int | None = None) -> str:
+    classified = classify_diagnostic_error(message)
+    if classified != "CLI 失败":
+        return classified
+    if http_status is not None:
+        return f"HTTP {http_status}"
+    return "请求失败"
+
+
+class CustomApiBenchmarkRunner:
+    def __init__(self):
+        self._cancel = threading.Event()
+        self._response_lock = threading.Lock()
+        self._response: object | None = None
+
+    def cancel(self) -> None:
+        self._cancel.set()
+        with self._response_lock:
+            response = self._response
+        if response is not None:
+            try:
+                response.close()  # type: ignore[union-attr]
+            except (OSError, ValueError):
+                pass
+
+    def run(
+        self,
+        cases: list[tuple[CustomApiEndpoint, str]],
+        attempts: int,
+        timeout_seconds: float,
+        on_progress: Callable[[dict[str, object]], None],
+        on_result: Callable[[CustomApiResult], None],
+    ) -> None:
+        try:
+            for attempt in range(1, attempts + 1):
+                for endpoint, api_key in cases:
+                    if self._cancel.is_set():
+                        return
+                    try:
+                        result = self._run_one(
+                            endpoint,
+                            api_key,
+                            attempt,
+                            timeout_seconds,
+                            on_progress,
+                        )
+                    except Exception as exc:
+                        result = CustomApiResult(
+                            endpoint_id=endpoint.endpoint_id,
+                            name=endpoint.name,
+                            model=endpoint.model,
+                            attempt=attempt,
+                            success=False,
+                            status="测速器异常",
+                            http_status=None,
+                            first_response_seconds=None,
+                            total_seconds=0.0,
+                            error=str(exc).replace(api_key, "[REDACTED]")
+                            if api_key
+                            else str(exc),
+                        )
+                    on_result(result)
+        finally:
+            on_progress(
+                {"phase": "finished", "cancelled": self._cancel.is_set()}
+            )
+
+    def _run_one(
+        self,
+        endpoint: CustomApiEndpoint,
+        api_key: str,
+        attempt: int,
+        timeout_seconds: float,
+        on_progress: Callable[[dict[str, object]], None],
+    ) -> CustomApiResult:
+        payload = json.dumps(
+            {
+                "model": endpoint.model,
+                "messages": [{"role": "user", "content": CUSTOM_API_PROMPT}],
+                "stream": True,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        headers = {
+            "Accept": "text/event-stream, application/json",
+            "Content-Type": "application/json",
+            "Connection": "close",
+            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        }
+        if endpoint.auth_mode == "bearer":
+            headers["Authorization"] = f"Bearer {api_key}"
+        elif endpoint.auth_mode == "x-api-key":
+            headers["x-api-key"] = api_key
+        request = urllib.request.Request(
+            endpoint.url,
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+
+        started = time.monotonic()
+        first_response: float | None = None
+        http_status: int | None = None
+        output_parts: list[str] = []
+        output_tokens = 0
+        content_events = 0
+        plain_body: list[bytes] = []
+        response = None
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout_seconds)
+            with self._response_lock:
+                self._response = response
+            http_status = response.getcode()
+            for raw_line in response:
+                if self._cancel.is_set():
+                    raise InterruptedError("用户停止了测试")
+                elapsed = time.monotonic() - started
+                if elapsed >= timeout_seconds:
+                    raise TimeoutError(f"请求超时（超过 {timeout_seconds:g} 秒）")
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                if first_response is None:
+                    first_response = elapsed
+                line = stripped.decode("utf-8", errors="replace")
+                if line.startswith("data:"):
+                    data_text = line[5:].strip()
+                    if data_text == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data_text)
+                    except json.JSONDecodeError:
+                        continue
+                    content = _extract_custom_api_content(event)
+                    if content:
+                        output_parts.append(content)
+                        content_events += 1
+                    output_tokens = max(
+                        output_tokens,
+                        _extract_custom_api_output_tokens(event),
+                    )
+                else:
+                    plain_body.append(raw_line)
+
+                text = "".join(output_parts)
+                live_tokens = output_tokens or _estimated_token_count(text)
+                generation_seconds = max(0.05, elapsed - (first_response or 0.0))
+                on_progress(
+                    {
+                        "phase": "running",
+                        "name": endpoint.name,
+                        "model": endpoint.model,
+                        "attempt": attempt,
+                        "elapsed": elapsed,
+                        "output_tokens": live_tokens,
+                        "tokens_per_second": live_tokens / generation_seconds,
+                        "estimated": output_tokens == 0,
+                    }
+                )
+
+            if plain_body:
+                body = b"".join(plain_body).decode("utf-8", errors="replace")
+                parsed = json.loads(body)
+                content = _extract_custom_api_content(parsed)
+                if content:
+                    output_parts.append(content)
+                    content_events += 1
+                output_tokens = max(
+                    output_tokens,
+                    _extract_custom_api_output_tokens(parsed),
+                )
+            response.close()
+            with self._response_lock:
+                self._response = None
+
+            total_seconds = time.monotonic() - started
+            output_text = "".join(output_parts)
+            estimated = output_tokens == 0
+            if estimated:
+                output_tokens = _estimated_token_count(output_text)
+            if not output_text and output_tokens == 0:
+                raise ValueError("HTTP 200，但没有返回可识别的模型输出")
+            if first_response is None:
+                first_response = total_seconds
+            if content_events >= 2:
+                speed_seconds = max(0.05, total_seconds - first_response)
+            else:
+                speed_seconds = max(0.05, total_seconds)
+            return CustomApiResult(
+                endpoint_id=endpoint.endpoint_id,
+                name=endpoint.name,
+                model=endpoint.model,
+                attempt=attempt,
+                success=True,
+                status="成功",
+                http_status=http_status,
+                first_response_seconds=first_response,
+                total_seconds=total_seconds,
+                output_tokens=output_tokens,
+                tokens_estimated=estimated,
+                tokens_per_second=output_tokens / speed_seconds,
+            )
+        except urllib.error.HTTPError as exc:
+            http_status = exc.code
+            try:
+                detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+            except OSError:
+                detail = ""
+            message = f"HTTP {exc.code} {exc.reason}"
+            if detail:
+                message += f"：{detail}"
+        except (TimeoutError, socket.timeout) as exc:
+            message = str(exc) or f"请求超时（超过 {timeout_seconds:g} 秒）"
+        except urllib.error.URLError as exc:
+            message = f"网络连接失败：{exc.reason}"
+        except InterruptedError as exc:
+            message = str(exc)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            message = str(exc)
+        finally:
+            if response is not None:
+                try:
+                    response.close()
+                except (OSError, ValueError):
+                    pass
+            with self._response_lock:
+                self._response = None
+
+        if api_key:
+            message = message.replace(api_key, "[REDACTED]")
+        total_seconds = time.monotonic() - started
+        return CustomApiResult(
+            endpoint_id=endpoint.endpoint_id,
+            name=endpoint.name,
+            model=endpoint.model,
+            attempt=attempt,
+            success=False,
+            status=_custom_api_error_status(message, http_status),
+            http_status=http_status,
+            first_response_seconds=first_response,
+            total_seconds=total_seconds,
+            error=message,
+        )
+
+
 @dataclass(frozen=True)
 class ParsedSession:
     started_at: datetime
@@ -1053,6 +1670,7 @@ class CodexAgentConsole:
         self.root = root
         self.home = home or codex_home()
         self.config_store = ConfigStore(self.home / "config.toml")
+        self.custom_api_store = CustomApiStore(self.home / CUSTOM_API_CONFIG_NAME)
         self.stats_reader = SessionStatsReader(self.home / "sessions")
         self._refresh_running = False
         self._diagnostic_window: tk.Toplevel | None = None
@@ -1060,6 +1678,12 @@ class CodexAgentConsole:
         self._diagnostic_generation = 0
         self._diagnostic_results: list[DiagnosticResult] = []
         self._diagnostic_errors: dict[str, str] = {}
+        self._custom_api_window: tk.Toplevel | None = None
+        self._custom_api_runner: CustomApiBenchmarkRunner | None = None
+        self._custom_api_generation = 0
+        self._custom_api_endpoints: list[CustomApiEndpoint] = []
+        self._custom_api_results: list[CustomApiResult] = []
+        self._custom_api_error_details: dict[str, str] = {}
 
         root.title(f"{APP_NAME} {APP_VERSION}")
         root.geometry("1040x720")
@@ -1093,6 +1717,16 @@ class CodexAgentConsole:
         style.configure("Primary.TButton", background="#2f81f7", foreground="#ffffff")
         style.map("Primary.TButton", background=[("active", "#4793ff")])
         style.configure("TRadiobutton", background="#171b20", foreground="#e7e9ec")
+        style.configure(
+            "Panel.TCheckbutton",
+            background="#171b20",
+            foreground="#e7e9ec",
+        )
+        style.map(
+            "Panel.TCheckbutton",
+            background=[("active", "#22272e")],
+            foreground=[("disabled", "#7d8590")],
+        )
         style.configure("TCombobox", fieldbackground="#22272e", foreground="#ffffff")
         style.map(
             "TCombobox",
@@ -1271,6 +1905,11 @@ class CodexAgentConsole:
             style="Primary.TButton",
             command=self.open_diagnostics,
         ).pack(side="left")
+        ttk.Button(
+            bottom,
+            text="自定义 API",
+            command=self.open_custom_api_benchmark,
+        ).pack(side="left", padx=(8, 0))
         self.updated_var = tk.StringVar(value="尚未刷新")
         ttk.Label(bottom, textvariable=self.updated_var, style="Muted.TLabel").pack(
             side="right"
@@ -1836,6 +2475,756 @@ class CodexAgentConsole:
             else "--"
         )
 
+    @staticmethod
+    def _custom_auth_label(auth_mode: str) -> str:
+        return {
+            "bearer": "Bearer",
+            "x-api-key": "x-api-key",
+            "none": "无鉴权",
+        }.get(auth_mode, auth_mode)
+
+    def open_custom_api_benchmark(self) -> None:
+        if (
+            self._custom_api_window is not None
+            and self._custom_api_window.winfo_exists()
+        ):
+            self._custom_api_window.deiconify()
+            self._custom_api_window.lift()
+            self._custom_api_window.focus_force()
+            return
+        try:
+            self._custom_api_endpoints = self.custom_api_store.load()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法读取自定义 API 配置：{exc}")
+            return
+
+        window = tk.Toplevel(self.root)
+        self._custom_api_window = window
+        window.title(f"自定义 API 测速 · {APP_NAME} {APP_VERSION}")
+        window.geometry("1280x820")
+        window.minsize(980, 680)
+        window.configure(bg="#111418")
+        window.protocol("WM_DELETE_WINDOW", self._close_custom_api)
+
+        shell = ttk.Frame(window, padding=16)
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(0, weight=1)
+        shell.rowconfigure(5, weight=1)
+
+        header = ttk.Frame(shell)
+        header.grid(row=0, column=0, sticky="ew")
+        ttk.Label(header, text="已保存 API", style="Section.TLabel").pack(side="left")
+        ttk.Label(
+            header,
+            text="自定义 API 使用独立 Key；Codex 官方订阅使用 CLI 登录",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(14, 0))
+        self.custom_api_manage_buttons: list[ttk.Button] = []
+        for text, command in (
+            ("新增 API", lambda: self._open_custom_api_editor(None)),
+            ("全选", lambda: self._set_all_custom_api_selection(True)),
+            ("清空", lambda: self._set_all_custom_api_selection(False)),
+        ):
+            button = ttk.Button(header, text=text, command=command)
+            button.pack(side="right", padx=(8 if self.custom_api_manage_buttons else 0, 0))
+            self.custom_api_manage_buttons.append(button)
+        official_button = ttk.Button(
+            header,
+            text="测试 Codex 官方订阅",
+            command=self.open_diagnostics,
+        )
+        official_button.pack(side="right", padx=(0, 8))
+        self.custom_api_manage_buttons.append(official_button)
+
+        endpoint_panel = ttk.Frame(shell, style="Panel.TFrame", padding=10)
+        endpoint_panel.grid(row=1, column=0, sticky="ew", pady=(10, 10))
+        endpoint_panel.columnconfigure(0, weight=1)
+        endpoint_panel.rowconfigure(0, weight=1)
+        list_frame = ttk.Frame(endpoint_panel, style="Panel.TFrame")
+        list_frame.grid(row=0, column=0, sticky="ew")
+        list_frame.columnconfigure(0, weight=1)
+        self.custom_api_canvas = tk.Canvas(
+            list_frame,
+            height=148,
+            background="#171b20",
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        self.custom_api_canvas.grid(row=0, column=0, sticky="ew")
+        scrollbar = ttk.Scrollbar(
+            list_frame,
+            orient="vertical",
+            command=self.custom_api_canvas.yview,
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.custom_api_canvas.configure(yscrollcommand=scrollbar.set)
+        self.custom_api_list_frame = ttk.Frame(
+            self.custom_api_canvas,
+            style="Panel.TFrame",
+        )
+        self.custom_api_list_frame.columnconfigure(0, weight=1)
+        self.custom_api_canvas_window = self.custom_api_canvas.create_window(
+            (0, 0),
+            window=self.custom_api_list_frame,
+            anchor="nw",
+        )
+        self.custom_api_list_frame.bind(
+            "<Configure>",
+            lambda _event: self.custom_api_canvas.configure(
+                scrollregion=self.custom_api_canvas.bbox("all")
+            ),
+        )
+        self.custom_api_canvas.bind(
+            "<Configure>",
+            lambda event: self.custom_api_canvas.itemconfigure(
+                self.custom_api_canvas_window,
+                width=event.width,
+            ),
+        )
+        self._custom_api_selection_vars: dict[str, tk.BooleanVar] = {}
+        self._custom_api_checks: list[ttk.Checkbutton] = []
+        self._custom_api_row_buttons: list[ttk.Button] = []
+        self._rebuild_custom_api_list()
+
+        controls = ttk.Frame(shell)
+        controls.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.custom_api_attempts_var = tk.StringVar(value="3")
+        self.custom_api_timeout_var = tk.IntVar(value=120)
+        ttk.Label(controls, text="测试次数").pack(side="left")
+        self.custom_api_attempts_combo = ttk.Combobox(
+            controls,
+            textvariable=self.custom_api_attempts_var,
+            values=("1", "3", "5"),
+            state="readonly",
+            width=5,
+        )
+        self.custom_api_attempts_combo.pack(side="left", padx=(8, 18))
+        ttk.Label(controls, text="单次超时（秒）").pack(side="left")
+        self.custom_api_timeout_spin = ttk.Spinbox(
+            controls,
+            from_=10,
+            to=600,
+            textvariable=self.custom_api_timeout_var,
+            width=7,
+        )
+        self.custom_api_timeout_spin.pack(side="left", padx=(8, 18))
+        self.custom_api_start_button = ttk.Button(
+            controls,
+            text="开始测速",
+            style="Primary.TButton",
+            command=self._start_custom_api_benchmark,
+        )
+        self.custom_api_start_button.pack(side="left")
+        self.custom_api_stop_button = ttk.Button(
+            controls,
+            text="停止",
+            command=self._stop_custom_api,
+            state="disabled",
+        )
+        self.custom_api_stop_button.pack(side="left", padx=8)
+        self.custom_api_cost_var = tk.StringVar(
+            value="测速会发起真实请求并消耗对应 API 配额。"
+        )
+        ttk.Label(
+            controls,
+            textvariable=self.custom_api_cost_var,
+            style="Muted.TLabel",
+        ).pack(side="right")
+
+        comparison_panel = ttk.Frame(shell, style="Panel.TFrame", padding=10)
+        comparison_panel.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        comparison_panel.columnconfigure(0, weight=1)
+        ttk.Label(
+            comparison_panel,
+            text="API 对比",
+            style="Section.TLabel",
+        ).grid(row=0, column=0, sticky="w")
+        self.custom_api_fastest_var = tk.StringVar(value="最快：--")
+        self.custom_api_stable_var = tk.StringVar(value="最稳定：--")
+        self.custom_api_coverage_var = tk.StringVar(value="完成：0/0")
+        comparison_header = ttk.Frame(comparison_panel, style="Panel.TFrame")
+        comparison_header.grid(row=0, column=0, sticky="e")
+        ttk.Label(
+            comparison_header,
+            textvariable=self.custom_api_fastest_var,
+            style="PanelMuted.TLabel",
+        ).pack(side="left", padx=8)
+        ttk.Label(
+            comparison_header,
+            textvariable=self.custom_api_stable_var,
+            style="PanelMuted.TLabel",
+        ).pack(side="left", padx=8)
+        ttk.Label(
+            comparison_header,
+            textvariable=self.custom_api_coverage_var,
+            style="PanelMuted.TLabel",
+        ).pack(side="left", padx=8)
+        self.custom_api_compare_tree = ttk.Treeview(
+            comparison_panel,
+            columns=("name", "model", "success", "first", "total", "jitter", "speed"),
+            show="headings",
+            height=4,
+        )
+        compare_headings = {
+            "name": "API",
+            "model": "模型",
+            "success": "成功率",
+            "first": "平均首响应",
+            "total": "平均总耗时",
+            "jitter": "耗时波动",
+            "speed": "Tokens/s",
+        }
+        compare_widths = {
+            "name": 170,
+            "model": 150,
+            "success": 90,
+            "first": 110,
+            "total": 110,
+            "jitter": 100,
+            "speed": 100,
+        }
+        for name in self.custom_api_compare_tree["columns"]:
+            self.custom_api_compare_tree.heading(name, text=compare_headings[name])
+            self.custom_api_compare_tree.column(
+                name,
+                width=compare_widths[name],
+                minwidth=70,
+                anchor="w" if name in ("name", "model") else "center",
+            )
+        self.custom_api_compare_tree.tag_configure("winner", foreground="#7ee787")
+        self.custom_api_compare_tree.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+
+        self.custom_api_live_var = tk.StringVar(value="尚未开始测速")
+        ttk.Label(
+            shell,
+            textvariable=self.custom_api_live_var,
+        ).grid(row=4, column=0, sticky="ew", pady=(0, 8))
+
+        detail_frame = ttk.Frame(shell)
+        detail_frame.grid(row=5, column=0, sticky="nsew")
+        shell.rowconfigure(5, weight=1)
+        detail_frame.columnconfigure(0, weight=1)
+        detail_frame.rowconfigure(0, weight=1)
+        self.custom_api_detail_tree = ttk.Treeview(
+            detail_frame,
+            columns=(
+                "name",
+                "model",
+                "attempt",
+                "status",
+                "http",
+                "first",
+                "total",
+                "output",
+                "speed",
+                "error",
+            ),
+            show="headings",
+            selectmode="browse",
+        )
+        detail_headings = {
+            "name": "API",
+            "model": "模型",
+            "attempt": "轮次",
+            "status": "状态",
+            "http": "HTTP",
+            "first": "首响应",
+            "total": "总耗时",
+            "output": "输出",
+            "speed": "Tokens/s",
+            "error": "错误详情",
+        }
+        detail_widths = {
+            "name": 160,
+            "model": 140,
+            "attempt": 55,
+            "status": 110,
+            "http": 55,
+            "first": 82,
+            "total": 82,
+            "output": 80,
+            "speed": 90,
+            "error": 360,
+        }
+        for name in self.custom_api_detail_tree["columns"]:
+            self.custom_api_detail_tree.heading(name, text=detail_headings[name])
+            self.custom_api_detail_tree.column(
+                name,
+                width=detail_widths[name],
+                minwidth=50,
+                stretch=name == "error",
+                anchor="w" if name in ("name", "model", "error") else "center",
+            )
+        self.custom_api_detail_tree.tag_configure("success", foreground="#7ee787")
+        self.custom_api_detail_tree.tag_configure("failure", foreground="#ff9b9b")
+        self.custom_api_detail_tree.grid(row=0, column=0, sticky="nsew")
+        detail_vertical = ttk.Scrollbar(
+            detail_frame,
+            orient="vertical",
+            command=self.custom_api_detail_tree.yview,
+        )
+        detail_vertical.grid(row=0, column=1, sticky="ns")
+        detail_horizontal = ttk.Scrollbar(
+            detail_frame,
+            orient="horizontal",
+            command=self.custom_api_detail_tree.xview,
+        )
+        detail_horizontal.grid(row=1, column=0, sticky="ew")
+        self.custom_api_detail_tree.configure(
+            yscrollcommand=detail_vertical.set,
+            xscrollcommand=detail_horizontal.set,
+        )
+        self.custom_api_detail_tree.bind(
+            "<<TreeviewSelect>>",
+            self._show_custom_api_error,
+        )
+        self.custom_api_error_var = tk.StringVar(value="错误详情：无")
+        ttk.Label(
+            shell,
+            textvariable=self.custom_api_error_var,
+            style="Muted.TLabel",
+            wraplength=1080,
+            justify="left",
+        ).grid(row=6, column=0, sticky="w", pady=(8, 0))
+
+    def _rebuild_custom_api_list(self) -> None:
+        for child in self.custom_api_list_frame.winfo_children():
+            child.destroy()
+        self._custom_api_selection_vars = {}
+        self._custom_api_checks = []
+        self._custom_api_row_buttons = []
+        if not self._custom_api_endpoints:
+            ttk.Label(
+                self.custom_api_list_frame,
+                text="尚未保存 API，点击右上角“新增 API”。",
+                style="PanelMuted.TLabel",
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=12)
+            return
+        for row_index, endpoint in enumerate(self._custom_api_endpoints):
+            row = ttk.Frame(self.custom_api_list_frame, style="Panel.TFrame")
+            row.grid(row=row_index, column=0, sticky="ew", padx=2, pady=3)
+            row.columnconfigure(0, weight=1)
+            selected = tk.BooleanVar(value=endpoint.selected)
+            self._custom_api_selection_vars[endpoint.endpoint_id] = selected
+            check = ttk.Checkbutton(
+                row,
+                text=f"{endpoint.name} · {endpoint.model}",
+                variable=selected,
+                style="Panel.TCheckbutton",
+                command=lambda eid=endpoint.endpoint_id: self._custom_api_selection_changed(eid),
+            )
+            check.grid(row=0, column=0, sticky="w")
+            self._custom_api_checks.append(check)
+            ttk.Label(
+                row,
+                text=f"{endpoint.url} · {self._custom_auth_label(endpoint.auth_mode)}",
+                style="PanelMuted.TLabel",
+                wraplength=760,
+                justify="left",
+            ).grid(row=1, column=0, sticky="w", padx=(28, 0))
+            edit_button = ttk.Button(
+                row,
+                text="编辑",
+                command=lambda item=endpoint: self._open_custom_api_editor(item),
+            )
+            edit_button.grid(row=0, column=1, rowspan=2, padx=(8, 0))
+            delete_button = ttk.Button(
+                row,
+                text="删除",
+                command=lambda eid=endpoint.endpoint_id: self._delete_custom_api(eid),
+            )
+            delete_button.grid(row=0, column=2, rowspan=2, padx=(6, 0))
+            self._custom_api_row_buttons.extend((edit_button, delete_button))
+
+    def _save_custom_api_endpoints(self) -> bool:
+        try:
+            self.custom_api_store.save(self._custom_api_endpoints)
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"保存自定义 API 失败：{exc}")
+            return False
+        return True
+
+    def _custom_api_selection_changed(self, endpoint_id: str) -> None:
+        selected = self._custom_api_selection_vars[endpoint_id].get()
+        for endpoint in self._custom_api_endpoints:
+            if endpoint.endpoint_id == endpoint_id:
+                endpoint.selected = selected
+                break
+        self._save_custom_api_endpoints()
+
+    def _set_all_custom_api_selection(self, selected: bool) -> None:
+        for endpoint in self._custom_api_endpoints:
+            endpoint.selected = selected
+        self._rebuild_custom_api_list()
+        self._save_custom_api_endpoints()
+
+    def _open_custom_api_editor(self, endpoint: CustomApiEndpoint | None) -> None:
+        editor = tk.Toplevel(self._custom_api_window)
+        editor.title("编辑自定义 API" if endpoint else "新增自定义 API")
+        editor.geometry("660x430")
+        editor.minsize(580, 380)
+        editor.configure(bg="#111418")
+        editor.transient(self._custom_api_window)
+        editor.grab_set()
+        panel = ttk.Frame(editor, style="Panel.TFrame", padding=18)
+        panel.pack(fill="both", expand=True)
+        panel.columnconfigure(1, weight=1)
+
+        name_var = tk.StringVar(value=endpoint.name if endpoint else "")
+        url_var = tk.StringVar(value=endpoint.url if endpoint else "")
+        model_var = tk.StringVar(value=endpoint.model if endpoint else "")
+        auth_var = tk.StringVar(
+            value=self._custom_auth_label(endpoint.auth_mode)
+            if endpoint
+            else "Bearer"
+        )
+        key_var = tk.StringVar()
+        fields = (
+            ("名称", name_var),
+            ("完整 URL", url_var),
+            ("模型", model_var),
+        )
+        for row, (label, variable) in enumerate(fields):
+            ttk.Label(panel, text=label).grid(row=row, column=0, sticky="w", pady=8)
+            entry = ttk.Entry(panel, textvariable=variable)
+            entry.grid(row=row, column=1, sticky="ew", pady=8)
+        ttk.Label(panel, text="鉴权方式").grid(row=3, column=0, sticky="w", pady=8)
+        auth_combo = ttk.Combobox(
+            panel,
+            textvariable=auth_var,
+            values=("Bearer", "x-api-key", "无鉴权"),
+            state="readonly",
+        )
+        auth_combo.grid(row=3, column=1, sticky="ew", pady=8)
+        ttk.Label(panel, text="API Key").grid(row=4, column=0, sticky="w", pady=8)
+        ttk.Entry(panel, textvariable=key_var, show="*").grid(
+            row=4, column=1, sticky="ew", pady=8
+        )
+        ttk.Label(
+            panel,
+            text=(
+                "编辑时留空保留已保存 Key；Key 会使用 Windows DPAPI 加密，"
+                "不会明文写入配置。"
+            ),
+            style="PanelMuted.TLabel",
+            wraplength=490,
+            justify="left",
+        ).grid(row=5, column=1, sticky="w", pady=(0, 12))
+        button_row = ttk.Frame(panel, style="Panel.TFrame")
+        button_row.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def save_editor() -> None:
+            auth_mode = {
+                "Bearer": "bearer",
+                "x-api-key": "x-api-key",
+                "无鉴权": "none",
+            }.get(auth_var.get(), "bearer")
+            existing_key = endpoint.encrypted_api_key if endpoint else ""
+            key = key_var.get()
+            if auth_mode == "none":
+                encrypted_key = ""
+            elif key:
+                try:
+                    encrypted_key = protect_secret(key)
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, f"API Key 加密失败：{exc}", parent=editor)
+                    return
+            else:
+                encrypted_key = existing_key
+            candidate = CustomApiEndpoint(
+                endpoint_id=endpoint.endpoint_id if endpoint else uuid.uuid4().hex,
+                name=name_var.get().strip(),
+                url=url_var.get().strip(),
+                model=model_var.get().strip(),
+                auth_mode=auth_mode,
+                encrypted_api_key=encrypted_key,
+                selected=endpoint.selected if endpoint else True,
+            )
+            try:
+                validate_custom_api_endpoint(candidate)
+                if candidate.auth_mode != "none" and not candidate.encrypted_api_key:
+                    raise ValueError("请输入 API Key")
+                if candidate.auth_mode != "none" and not key and not endpoint:
+                    raise ValueError("新增 API 时必须输入 API Key")
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, str(exc), parent=editor)
+                return
+            if endpoint:
+                for index, current in enumerate(self._custom_api_endpoints):
+                    if current.endpoint_id == endpoint.endpoint_id:
+                        self._custom_api_endpoints[index] = candidate
+                        break
+            else:
+                self._custom_api_endpoints.append(candidate)
+            if self._save_custom_api_endpoints():
+                self._rebuild_custom_api_list()
+                editor.destroy()
+
+        ttk.Button(button_row, text="取消", command=editor.destroy).pack(
+            side="right", padx=(8, 0)
+        )
+        ttk.Button(
+            button_row,
+            text="保存 API",
+            style="Primary.TButton",
+            command=save_editor,
+        ).pack(side="right")
+        editor.bind("<Return>", lambda _event: save_editor())
+
+    def _delete_custom_api(self, endpoint_id: str) -> None:
+        endpoint = next(
+            (item for item in self._custom_api_endpoints if item.endpoint_id == endpoint_id),
+            None,
+        )
+        if endpoint is None:
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"删除已保存 API“{endpoint.name}”？\n加密保存的 Key 也会一并删除。",
+            parent=self._custom_api_window,
+        ):
+            return
+        self._custom_api_endpoints = [
+            item for item in self._custom_api_endpoints if item.endpoint_id != endpoint_id
+        ]
+        self._save_custom_api_endpoints()
+        self._rebuild_custom_api_list()
+
+    def _start_custom_api_benchmark(self) -> None:
+        try:
+            attempts = int(self.custom_api_attempts_var.get())
+            timeout_seconds = int(self.custom_api_timeout_var.get())
+            if attempts not in (1, 3, 5):
+                raise ValueError("测试次数只能是 1、3 或 5")
+            if not 10 <= timeout_seconds <= 600:
+                raise ValueError("超时必须在 10 到 600 秒之间")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法开始测速：{exc}")
+            return
+        selected_endpoints = [
+            endpoint for endpoint in self._custom_api_endpoints if endpoint.selected
+        ]
+        if not selected_endpoints:
+            messagebox.showerror(APP_NAME, "请至少勾选一个 API。")
+            return
+        cases: list[tuple[CustomApiEndpoint, str]] = []
+        try:
+            for endpoint in selected_endpoints:
+                validate_custom_api_endpoint(endpoint)
+                api_key = (
+                    unprotect_secret(endpoint.encrypted_api_key)
+                    if endpoint.auth_mode != "none"
+                    else ""
+                )
+                if endpoint.auth_mode != "none" and not api_key:
+                    raise ValueError(f"{endpoint.name} 没有可用的 API Key")
+                cases.append((endpoint, api_key))
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法读取 API 配置：{exc}")
+            return
+
+        self._custom_api_generation += 1
+        generation = self._custom_api_generation
+        self._custom_api_results = []
+        self._custom_api_error_details = {}
+        for tree in (self.custom_api_compare_tree, self.custom_api_detail_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        self.custom_api_error_var.set("错误详情：无")
+        self.custom_api_fastest_var.set("最快：--")
+        self.custom_api_stable_var.set("最稳定：--")
+        self.custom_api_coverage_var.set(
+            f"完成：0/{len(cases) * attempts}"
+        )
+        self._set_custom_api_running(True)
+        runner = CustomApiBenchmarkRunner()
+        self._custom_api_runner = runner
+
+        def progress(payload: dict[str, object]) -> None:
+            self.root.after(
+                0,
+                lambda value=payload: self._apply_custom_api_progress(
+                    value, generation
+                ),
+            )
+
+        def result(value: CustomApiResult) -> None:
+            self.root.after(
+                0,
+                lambda item=value: self._apply_custom_api_result(item, generation),
+            )
+
+        threading.Thread(
+            target=runner.run,
+            args=(cases, attempts, float(timeout_seconds), progress, result),
+            daemon=True,
+        ).start()
+
+    def _set_custom_api_running(self, running: bool) -> None:
+        if not self._custom_api_window_exists():
+            return
+        self.custom_api_attempts_combo.configure(
+            state="disabled" if running else "readonly"
+        )
+        self.custom_api_timeout_spin.configure(
+            state="disabled" if running else "normal"
+        )
+        self.custom_api_start_button.configure(
+            state="disabled" if running else "normal"
+        )
+        self.custom_api_stop_button.configure(
+            state="normal" if running else "disabled"
+        )
+        for button in self.custom_api_manage_buttons:
+            button.configure(state="disabled" if running else "normal")
+        for check in self._custom_api_checks:
+            check.configure(state="disabled" if running else "normal")
+        for button in self._custom_api_row_buttons:
+            button.configure(state="disabled" if running else "normal")
+
+    def _custom_api_window_exists(self) -> bool:
+        return bool(
+            self._custom_api_window is not None
+            and self._custom_api_window.winfo_exists()
+        )
+
+    def _apply_custom_api_progress(
+        self, payload: dict[str, object], generation: int
+    ) -> None:
+        if generation != self._custom_api_generation or not self._custom_api_window_exists():
+            return
+        if payload.get("phase") == "running":
+            estimated = "约 " if payload.get("estimated") else ""
+            self.custom_api_live_var.set(
+                f"{payload.get('name')} · {payload.get('model')} · "
+                f"第 {payload.get('attempt')} 轮 · "
+                f"{float(payload.get('elapsed') or 0):.1f}s · "
+                f"输出 {estimated}{int(payload.get('output_tokens') or 0):,} · "
+                f"{float(payload.get('tokens_per_second') or 0):.1f} Tokens/s"
+            )
+            return
+        if payload.get("phase") == "finished":
+            self.custom_api_live_var.set(
+                "自定义 API 测速已停止"
+                if payload.get("cancelled")
+                else "自定义 API 测速完成"
+            )
+            self._custom_api_runner = None
+            self._set_custom_api_running(False)
+
+    def _apply_custom_api_result(
+        self, result: CustomApiResult, generation: int
+    ) -> None:
+        if generation != self._custom_api_generation or not self._custom_api_window_exists():
+            return
+        self._custom_api_results.append(result)
+        error = " ".join(result.error.split())
+        if len(error) > 220:
+            error = error[:217] + "..."
+        item_id = self.custom_api_detail_tree.insert(
+            "",
+            "end",
+            values=(
+                result.name,
+                result.model,
+                result.attempt,
+                result.status,
+                result.http_status or "--",
+                (
+                    f"{result.first_response_seconds:.2f}s"
+                    if result.first_response_seconds is not None
+                    else "--"
+                ),
+                f"{result.total_seconds:.2f}s",
+                f"{'~' if result.tokens_estimated else ''}{result.output_tokens:,}",
+                f"{result.tokens_per_second:.1f}",
+                error,
+            ),
+            tags=("success" if result.success else "failure",),
+        )
+        self._custom_api_error_details[item_id] = result.error
+        self.custom_api_detail_tree.see(item_id)
+        self._update_custom_api_comparison()
+
+    def _update_custom_api_comparison(self) -> None:
+        summaries = summarize_custom_apis(self._custom_api_results)
+        for item in self.custom_api_compare_tree.get_children():
+            self.custom_api_compare_tree.delete(item)
+        fastest, stable = choose_custom_api_winners(summaries)
+        self.custom_api_fastest_var.set(
+            f"最快：{fastest.name} {fastest.average_total_time:.2f}s"
+            if fastest and fastest.average_total_time is not None
+            else "最快：--"
+        )
+        self.custom_api_stable_var.set(
+            f"最稳定：{stable.name} {stable.success_rate:.0f}%"
+            if stable
+            else "最稳定：--"
+        )
+        self.custom_api_coverage_var.set(
+            f"完成：{len(self._custom_api_results)} 次"
+        )
+        for summary in summaries:
+            tags: list[str] = []
+            if fastest and summary.endpoint_id == fastest.endpoint_id:
+                tags.append("winner")
+            if stable and summary.endpoint_id == stable.endpoint_id:
+                tags.append("winner")
+            self.custom_api_compare_tree.insert(
+                "",
+                "end",
+                values=(
+                    summary.name,
+                    summary.model,
+                    f"{summary.succeeded}/{summary.total} ({summary.success_rate:.0f}%)",
+                    (
+                        f"{summary.average_first_response:.2f}s"
+                        if summary.average_first_response is not None
+                        else "--"
+                    ),
+                    (
+                        f"{summary.average_total_time:.2f}s"
+                        if summary.average_total_time is not None
+                        else "--"
+                    ),
+                    (
+                        f"{summary.jitter_percent:.1f}%"
+                        if summary.jitter_percent is not None
+                        else "需多次"
+                    ),
+                    (
+                        f"{summary.average_tokens_per_second:.1f}"
+                        if summary.average_tokens_per_second is not None
+                        else "--"
+                    ),
+                ),
+                tags=tuple(tags),
+            )
+
+    def _show_custom_api_error(self, _event: object = None) -> None:
+        selected = self.custom_api_detail_tree.selection()
+        if not selected:
+            self.custom_api_error_var.set("错误详情：无")
+            return
+        error = self._custom_api_error_details.get(selected[0], "")
+        self.custom_api_error_var.set(f"错误详情：{error or '无'}")
+
+    def _stop_custom_api(self) -> None:
+        if self._custom_api_runner is None:
+            return
+        self.custom_api_live_var.set("正在停止当前 API 测速…")
+        self.custom_api_stop_button.configure(state="disabled")
+        self._custom_api_runner.cancel()
+
+    def _close_custom_api(self) -> None:
+        self._custom_api_generation += 1
+        if self._custom_api_runner is not None:
+            self._custom_api_runner.cancel()
+            self._custom_api_runner = None
+        if self._custom_api_window is not None:
+            self._custom_api_window.destroy()
+        self._custom_api_window = None
+
     def _show_diagnostic_error(self, _event: object = None) -> None:
         selected = self.diag_tree.selection()
         if not selected:
@@ -1858,6 +3247,10 @@ class CodexAgentConsole:
         if self._diagnostic_runner is not None:
             self._diagnostic_runner.cancel()
             self._diagnostic_runner = None
+        self._custom_api_generation += 1
+        if self._custom_api_runner is not None:
+            self._custom_api_runner.cancel()
+            self._custom_api_runner = None
         self.root.destroy()
 
     def _auto_refresh(self) -> None:

@@ -1,25 +1,38 @@
 # -*- coding: utf-8 -*-
 import json
+import sys
 import tempfile
+import threading
 import tomllib
 import unittest
+from unittest import mock
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from codex_agent_console import (
     AgentSettings,
     ConfigStore,
+    CustomApiBenchmarkRunner,
+    CustomApiEndpoint,
+    CustomApiResult,
+    CustomApiStore,
     DiagnosticResult,
     DUAL_MODE_POLICY_START,
     SessionTokenTail,
     SessionStatsReader,
+    choose_custom_api_winners,
     classify_diagnostic_error,
     find_codex_executable,
     has_dual_mode_policy,
     merge_dual_mode_policy,
     parse_codex_json_event,
+    protect_secret,
     summarize_diagnostics,
+    summarize_custom_apis,
+    unprotect_secret,
     update_toml_values,
+    validate_custom_api_endpoint,
 )
 
 
@@ -266,6 +279,20 @@ class DiagnosticLogicTests(unittest.TestCase):
             found = find_codex_executable(local, lambda _name: None)
             self.assertEqual(found, executable)
 
+    def test_diagnostic_passes_model_to_codex_once(self):
+        from codex_agent_console import CodexDiagnosticsRunner
+
+        runner = CodexDiagnosticsRunner(
+            Path("codex.exe"), Path(".codex"), Path("workspace")
+        )
+        with mock.patch("codex_agent_console.subprocess.Popen") as popen:
+            popen.side_effect = OSError("stop after command capture")
+            runner._run_one("主模型", "gpt-test", "high", 1, 10, lambda _value: None)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command.count("-m"), 1)
+        self.assertEqual(command[command.index("-m") + 1], "gpt-test")
+
     def test_tails_cumulative_token_events_incrementally(self):
         with tempfile.TemporaryDirectory() as temp:
             session = Path(temp) / "session.jsonl"
@@ -296,6 +323,127 @@ class DiagnosticLogicTests(unittest.TestCase):
             self.assertEqual(latest["input_tokens"], 100)
             self.assertEqual(latest["cached_input_tokens"], 50)
             self.assertEqual(latest["output_tokens"], 12)
+
+
+class CustomApiTests(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI only")
+    def test_dpapi_round_trip_and_store_does_not_write_plaintext_key(self):
+        secret = "temporary-test-key-not-a-real-credential"
+        encrypted = protect_secret(secret)
+        self.assertNotIn(secret, encrypted)
+        self.assertEqual(unprotect_secret(encrypted), secret)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "apis.json"
+            endpoint = CustomApiEndpoint(
+                "endpoint-a",
+                "Local API",
+                "http://127.0.0.1:8000/v1/chat/completions",
+                "test-model",
+                encrypted_api_key=encrypted,
+            )
+            store = CustomApiStore(path)
+            store.save([endpoint])
+            raw = path.read_text(encoding="utf-8")
+            self.assertNotIn(secret, raw)
+            loaded = store.load()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(unprotect_secret(loaded[0].encrypted_api_key), secret)
+
+    def test_endpoint_validation_requires_https_except_localhost(self):
+        validate_custom_api_endpoint(
+            CustomApiEndpoint(
+                "local",
+                "Local",
+                "http://localhost:8080/v1/chat/completions",
+                "model",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "HTTPS"):
+            validate_custom_api_endpoint(
+                CustomApiEndpoint(
+                    "remote",
+                    "Remote",
+                    "http://api.example.com/v1/chat/completions",
+                    "model",
+                )
+            )
+
+    def test_summary_prefers_reliable_api_over_faster_failed_api(self):
+        results = [
+            CustomApiResult(
+                "a", "Reliable", "m", 1, True, "成功", 200, 0.2, 1.0,
+                output_tokens=10, tokens_per_second=10.0,
+            ),
+            CustomApiResult(
+                "a", "Reliable", "m", 2, True, "成功", 200, 0.2, 1.1,
+                output_tokens=10, tokens_per_second=9.0,
+            ),
+            CustomApiResult(
+                "b", "Flaky", "m", 1, True, "成功", 200, 0.1, 0.4,
+                output_tokens=10, tokens_per_second=20.0,
+            ),
+            CustomApiResult(
+                "b", "Flaky", "m", 2, False, "请求超时", None, None, 3.0,
+            ),
+        ]
+        summaries = summarize_custom_apis(results)
+        fastest, stable = choose_custom_api_winners(summaries)
+        self.assertEqual(fastest.name, "Reliable")
+        self.assertEqual(stable.name, "Reliable")
+        reliable = next(item for item in summaries if item.name == "Reliable")
+        self.assertEqual(reliable.success_rate, 100.0)
+        self.assertIsNotNone(reliable.jitter_percent)
+
+    def test_streaming_benchmark_uses_bearer_key_and_parses_usage(self):
+        class Handler(BaseHTTPRequestHandler):
+            authorization = ""
+
+            def do_POST(self):
+                Handler.authorization = self.headers.get("Authorization", "")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunks = (
+                    b'data: {"choices":[{"delta":{"content":"API"}}]}\n\n',
+                    b'data: {"choices":[{"delta":{"content":"_OK"}}],'
+                    b'"usage":{"completion_tokens":2}}\n\n',
+                    b"data: [DONE]\n\n",
+                )
+                for chunk in chunks:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = CustomApiEndpoint(
+                "local",
+                "Local",
+                f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                "test-model",
+            )
+            results: list[CustomApiResult] = []
+            runner = CustomApiBenchmarkRunner()
+            runner.run(
+                [(endpoint, "test-bearer-key")],
+                1,
+                10.0,
+                lambda _event: None,
+                results.append,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(Handler.authorization, "Bearer test-bearer-key")
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].output_tokens, 2)
+        self.assertFalse(results[0].tokens_estimated)
+        self.assertIsNotNone(results[0].first_response_seconds)
 
 
 if __name__ == "__main__":
