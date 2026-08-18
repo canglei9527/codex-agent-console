@@ -20,6 +20,7 @@ from codex_agent_console import (
     CUSTOM_API_PROMPT,
     DiagnosticResult,
     DUAL_MODE_POLICY_START,
+    MANAGED_EXECUTOR_AGENT_NAME,
     SessionTokenTail,
     SessionStatsReader,
     build_dual_mode_policy,
@@ -92,6 +93,28 @@ class ConfigStoreTests(unittest.TestCase):
             self.assertTrue(backup.exists())
             self.assertIn('model = "old"', backup.read_text(encoding="utf-8"))
 
+    def test_saves_managed_executor_with_selected_model_and_effort(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.toml"
+            store = ConfigStore(config)
+            enabled = AgentSettings(
+                "gpt-5.6-sol", "high", "gpt-5.6-luna", "xhigh", True, 4
+            )
+            store.save(enabled)
+            executor = tomllib.loads(
+                store.managed_executor_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(executor["name"], MANAGED_EXECUTOR_AGENT_NAME)
+            self.assertEqual(executor["model"], "gpt-5.6-luna")
+            self.assertEqual(executor["model_reasoning_effort"], "xhigh")
+
+            store.save(
+                AgentSettings(
+                    "gpt-5.6-sol", "high", "gpt-5.6-luna", "xhigh", False, 4
+                )
+            )
+            self.assertFalse(store.managed_executor_path.exists())
+
     def test_dual_mode_policy_is_added_once_and_removed_without_losing_user_text(self):
         with tempfile.TemporaryDirectory() as temp:
             config = Path(temp) / "config.toml"
@@ -109,8 +132,8 @@ class ConfigStoreTests(unittest.TestCase):
             enabled_instructions = enabled_data["developer_instructions"]
             self.assertEqual(enabled_instructions.count(DUAL_MODE_POLICY_START), 1)
             self.assertIn("Keep my existing instruction.", enabled_instructions)
-            self.assertIn("model to `gpt-5.6-terra`", enabled_instructions)
-            self.assertIn("reasoning_effort to `medium`", enabled_instructions)
+            self.assertIn("model `gpt-5.6-terra`", enabled_instructions)
+            self.assertIn("reasoning effort `medium`", enabled_instructions)
             self.assertTrue(has_dual_mode_policy(enabled_instructions))
             self.assertTrue(store.load().agents_enabled)
 
@@ -143,7 +166,8 @@ class ConfigStoreTests(unittest.TestCase):
             "Simple execution work is a clear, bounded, low-risk task",
             policy,
         )
-        self.assertIn("exactly one execution subagent", policy)
+        self.assertIn("exactly one custom execution subagent", policy)
+        self.assertIn(MANAGED_EXECUTOR_AGENT_NAME, policy)
         self.assertIn("That subagent owns planning, tool use, implementation, testing", policy)
         self.assertIn("do not plan, decompose, inspect, implement, or test in the primary agent", policy)
         self.assertIn(
@@ -151,29 +175,37 @@ class ConfigStoreTests(unittest.TestCase):
             policy,
         )
         self.assertIn("report the blocker instead of silently taking over the work", policy)
-        self.assertIn("model to `gpt-5.6-terra`", policy)
-        self.assertIn("reasoning_effort to `low`", policy)
+        self.assertIn("model `gpt-5.6-terra`", policy)
+        self.assertIn("reasoning effort `low`", policy)
         self.assertNotIn("For every task that requires work", policy)
 
 
 class SessionStatsTests(unittest.TestCase):
     @staticmethod
-    def _write_session(path: Path, thread_source: str, totals: list[dict]) -> None:
+    def _write_session(
+        path: Path,
+        thread_source: str,
+        totals: list[dict],
+        source: dict | None = None,
+    ) -> None:
         now = datetime.now(timezone.utc).isoformat()
+        metadata = {
+            "timestamp": now,
+            "thread_source": thread_source,
+            "model": "gpt-5.6-terra" if thread_source == "subagent" else "gpt-5.6-sol",
+            "collaboration_mode": {
+                "settings": {
+                    "reasoning_effort": "medium" if thread_source == "subagent" else "high"
+                }
+            },
+        }
+        if source is not None:
+            metadata["source"] = source
         records = [
             {
                 "timestamp": now,
                 "type": "session_meta",
-                "payload": {
-                    "timestamp": now,
-                    "thread_source": thread_source,
-                    "model": "gpt-5.6-terra" if thread_source == "subagent" else "gpt-5.6-sol",
-                    "collaboration_mode": {
-                        "settings": {
-                            "reasoning_effort": "medium" if thread_source == "subagent" else "high"
-                        }
-                    },
-                },
+                "payload": metadata,
             }
         ]
         for total in totals:
@@ -220,6 +252,12 @@ class SessionStatsTests(unittest.TestCase):
                         "total_tokens": 60,
                     }
                 ],
+            )
+            self._write_session(
+                sessions / "guardian.jsonl",
+                "subagent",
+                [{"input_tokens": 999, "total_tokens": 999}],
+                {"subagent": {"other": "guardian"}},
             )
             main, sub = SessionStatsReader(sessions).aggregate(None)
             self.assertEqual(main.sessions, 1)

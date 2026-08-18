@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -71,6 +71,9 @@ MODEL_EFFORTS = {
 }
 DUAL_MODE_POLICY_START = "[Codex Agent Console: dual-model orchestration]"
 DUAL_MODE_POLICY_END = "[/Codex Agent Console: dual-model orchestration]"
+MANAGED_EXECUTOR_AGENT_NAME = "codex_agent_console_executor"
+MANAGED_EXECUTOR_AGENT_FILE = f"{MANAGED_EXECUTOR_AGENT_NAME}.toml"
+MANAGED_EXECUTOR_AGENT_MARKER = "# Managed by Codex Agent Console"
 _DUAL_MODE_POLICY_RE = re.compile(
     rf"{re.escape(DUAL_MODE_POLICY_START)}.*?{re.escape(DUAL_MODE_POLICY_END)}",
     re.DOTALL,
@@ -85,7 +88,7 @@ def build_dual_mode_policy(subagent_model: str, subagent_effort: str) -> str:
     model = _policy_value(subagent_model)
     effort = _policy_value(subagent_effort)
     return f"""{DUAL_MODE_POLICY_START}
-First make only a routing decision, without doing substantive task work. Simple execution work is a clear, bounded, low-risk task with one well-defined outcome that does not require cross-cutting design, multi-step investigation, or architectural decisions. For simple execution work, do not plan, decompose, inspect, implement, or test in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one execution subagent through the available multi-agent tools. That subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning, decomposition, integration, and final review. Delegate bounded implementation and execution tasks to subagents through the available multi-agent tools. Keep pure explanations, clarification questions, and user-facing status or final response handling in the primary agent. When spawning an execution subagent, explicitly set model to `{model}` and reasoning_effort to `{effort}`; do not rely on inherited defaults. If the subagent tool is unavailable for simple execution work, report the blocker instead of silently taking over the work. Only use a different subagent model or effort when the user explicitly requests it or the configured combination is unavailable.
+First make only a routing decision, without doing substantive task work. Simple execution work is a clear, bounded, low-risk task with one well-defined outcome that does not require cross-cutting design, multi-step investigation, or architectural decisions. For simple execution work, do not plan, decompose, inspect, implement, or test in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one custom execution subagent named `{MANAGED_EXECUTOR_AGENT_NAME}` through the available multi-agent tools. That subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning, decomposition, integration, and final review. Delegate bounded implementation and execution tasks to the `{MANAGED_EXECUTOR_AGENT_NAME}` subagent through the available multi-agent tools. Keep pure explanations, clarification questions, and user-facing status or final response handling in the primary agent. The `{MANAGED_EXECUTOR_AGENT_NAME}` configuration is authoritative for model `{model}` and reasoning effort `{effort}`; do not substitute a built-in worker, explorer, guardian, or inherited default. If the execution subagent tool is unavailable for simple execution work, report the blocker instead of silently taking over the work. Only use a different execution model or effort when the user explicitly requests it or the configured combination is unavailable.
 {DUAL_MODE_POLICY_END}"""
 
 
@@ -107,6 +110,18 @@ def merge_dual_mode_policy(
         return preserved
     policy = build_dual_mode_policy(subagent_model, subagent_effort)
     return f"{preserved}\n\n{policy}".strip()
+
+
+def build_managed_executor_agent(model: str, effort: str) -> str:
+    return f'''{MANAGED_EXECUTOR_AGENT_MARKER}
+name = {json.dumps(MANAGED_EXECUTOR_AGENT_NAME)}
+description = "Dedicated end-to-end execution agent managed by Codex Agent Console."
+model = {json.dumps(_policy_value(model))}
+model_reasoning_effort = {json.dumps(_policy_value(effort))}
+developer_instructions = """
+Own delegated execution work end-to-end. Plan, inspect, implement, validate, and report the complete result. Keep work scoped to the delegated request and return a concise handoff to the parent agent.
+"""
+'''
 
 
 def codex_home() -> Path:
@@ -233,6 +248,42 @@ class ConfigStore:
             ),
         )
 
+    @property
+    def managed_executor_path(self) -> Path:
+        return self.path.parent / "agents" / MANAGED_EXECUTOR_AGENT_FILE
+
+    def _save_managed_executor(self, settings: AgentSettings) -> None:
+        path = self.managed_executor_path
+        text = build_managed_executor_agent(
+            settings.subagent_model, settings.subagent_effort
+        )
+        tomllib.loads(text)
+        if path.exists():
+            existing = path.read_text(encoding="utf-8")
+            if MANAGED_EXECUTOR_AGENT_MARKER not in existing:
+                raise ValueError(f"执行代理文件已被用户占用：{path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(
+            prefix=path.name + ".", suffix=".tmp", dir=str(path.parent)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, path)
+        finally:
+            if os.path.exists(temp_name):
+                os.remove(temp_name)
+
+    def _remove_managed_executor(self) -> None:
+        path = self.managed_executor_path
+        if not path.exists():
+            return
+        existing = path.read_text(encoding="utf-8")
+        if MANAGED_EXECUTOR_AGENT_MARKER in existing:
+            path.unlink()
+
     def save(self, settings: AgentSettings) -> Path:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         original = self.path.read_text(encoding="utf-8") if self.path.exists() else ""
@@ -264,6 +315,11 @@ class ConfigStore:
             },
         )
         tomllib.loads(updated)
+
+        if settings.agents_enabled:
+            self._save_managed_executor(settings)
+        else:
+            self._remove_managed_executor()
 
         backup = self.path.with_name(self.path.name + ".codex-agent-console.bak")
         if self.path.exists():
@@ -1741,6 +1797,7 @@ class CustomApiBenchmarkRunner:
 class ParsedSession:
     started_at: datetime
     is_subagent: bool
+    is_execution_subagent: bool
     tokens: dict[str, object]
     model: str = ""
     reasoning_effort: str = ""
@@ -1754,6 +1811,7 @@ class SessionStatsReader:
     def _parse_file(self, path: Path) -> ParsedSession | None:
         started_at: datetime | None = None
         is_subagent = False
+        is_execution_subagent = False
         latest_tokens: dict[str, object] | None = None
         model = ""
         reasoning_effort = ""
@@ -1772,6 +1830,13 @@ class SessionStatsReader:
                         is_subagent = payload.get("thread_source") == "subagent" or (
                             isinstance(source, dict) and "subagent" in source
                         )
+                        source_subagent = (
+                            source.get("subagent") if isinstance(source, dict) else None
+                        )
+                        is_system_subagent = isinstance(source_subagent, dict) and bool(
+                            source_subagent.get("other")
+                        )
+                        is_execution_subagent = is_subagent and not is_system_subagent
                         stamp = payload.get("timestamp") or item.get("timestamp")
                         if isinstance(stamp, str):
                             try:
@@ -1808,6 +1873,7 @@ class SessionStatsReader:
         return ParsedSession(
             started_at,
             is_subagent,
+            is_execution_subagent,
             latest_tokens,
             model,
             reasoning_effort,
@@ -1843,7 +1909,9 @@ class SessionStatsReader:
             parsed = self._get_session(path)
             if parsed is None or (cutoff and parsed.started_at < cutoff):
                 continue
-            (subagent if parsed.is_subagent else main).add(
+            if parsed.is_subagent and not parsed.is_execution_subagent:
+                continue
+            (subagent if parsed.is_execution_subagent else main).add(
                 parsed.tokens,
                 parsed.model,
                 parsed.reasoning_effort,
@@ -2092,7 +2160,7 @@ class CodexAgentConsole:
 
         self.main_stats_vars = self._build_usage_block(parent, 1, "主模型")
         ttk.Separator(parent).grid(row=2, column=0, sticky="ew", pady=16)
-        self.sub_stats_vars = self._build_usage_block(parent, 3, "子代理")
+        self.sub_stats_vars = self._build_usage_block(parent, 3, "执行子模型")
 
         bottom = ttk.Frame(parent, style="Panel.TFrame")
         bottom.grid(row=4, column=0, sticky="ew", pady=(20, 0))
