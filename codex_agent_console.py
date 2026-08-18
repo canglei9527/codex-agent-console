@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -85,7 +85,7 @@ def build_dual_mode_policy(subagent_model: str, subagent_effort: str) -> str:
     model = _policy_value(subagent_model)
     effort = _policy_value(subagent_effort)
     return f"""{DUAL_MODE_POLICY_START}
-Route simple, bounded, low-risk execution work directly to the subagent instead of doing it in the primary agent. Do not keep that execution work in the primary agent because of coordination overhead. Keep pure explanations, clarification, user communication, and final responses in the primary agent. For non-trivial implementation work, use the primary agent for planning, decomposition, integration, and final review, and delegate bounded implementation and execution tasks to subagents through the available multi-agent tools. When spawning an execution subagent, explicitly set model to `{model}` and reasoning_effort to `{effort}`; do not rely on inherited defaults. Only use a different subagent model or effort when the user explicitly requests it or the configured combination is unavailable.
+Act as a thin dispatcher. For every task that requires work, do not plan, decompose, inspect, implement, or test in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one execution subagent through the available multi-agent tools. The subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. Keep only pure explanations, clarification questions, and user-facing status or final response handling in the primary agent. When spawning the execution subagent, explicitly set model to `{model}` and reasoning_effort to `{effort}`; do not rely on inherited defaults. If the subagent tool is unavailable, report the blocker instead of silently taking over the work. Only use a different subagent model or effort when the user explicitly requests it or the configured combination is unavailable.
 {DUAL_MODE_POLICY_END}"""
 
 
@@ -1996,7 +1996,7 @@ class CodexAgentConsole:
         mode_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         ttk.Radiobutton(
             mode_frame,
-            text="双模型协调（简单执行优先子模型）",
+            text="双模型协调（主模型直传 + 子模型全执行）",
             variable=self.mode_var,
             value="multi",
         ).pack(side="left", padx=(0, 18))
@@ -2056,7 +2056,7 @@ class CodexAgentConsole:
 
         ttk.Label(
             parent,
-            text="简单且独立的执行优先交给子模型；主模型负责规划、沟通和整合。设置仅对新任务生效。",
+            text="主模型只转交完整任务；子模型负责规划、执行、测试和结果。保存后重启 Codex Desktop，再新建任务生效。",
             style="Muted.TLabel",
         ).grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
@@ -2215,7 +2215,7 @@ class CodexAgentConsole:
             messagebox.showerror(APP_NAME, f"保存失败：{exc}")
             return False
         mode = "双模型协调策略已写入" if settings.agents_enabled else "普通模式已恢复"
-        self.status_var.set(f"已保存 · {mode} · 新任务生效")
+        self.status_var.set(f"已保存 · {mode} · 重启 Codex 后新任务生效")
         return True
 
     def enable_dual_mode(self) -> None:
@@ -2223,7 +2223,7 @@ class CodexAgentConsole:
         if self.save_settings():
             messagebox.showinfo(
                 APP_NAME,
-                "双模型协调策略已写入。\n\n请在 Codex 中新建任务；当前对话不会热切换。",
+                "主模型直传、子模型全执行策略已写入。\n\n请完全退出并重新打开 Codex Desktop，再新建任务；当前对话不会热切换。",
             )
 
     def restore_normal_mode(self) -> None:
