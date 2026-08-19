@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.9"
+APP_VERSION = "1.4.0"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (

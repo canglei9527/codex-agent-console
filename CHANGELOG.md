@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.4.0 - 2026-08-19
 
 - Add native Claude Messages (Anthropic) API detection with `x-api-key` authentication, Anthropic version headers, model discovery, streaming response parsing, usage parsing, and prompt-cache measurement.
 
