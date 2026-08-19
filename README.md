@@ -2,7 +2,7 @@
 
 一个非官方的 Codex Windows 桌面控制台，用于管理主模型、子代理默认值和双模型协调策略，并查看本机 Token 与缓存命中统计。
 
-当前版本：`1.3.8`
+当前版本：`1.3.9`
 
 > 本项目是社区工具，不是 OpenAI 官方产品。它只修改 Codex 官方支持的本地配置项。
 
@@ -27,7 +27,7 @@
 - 自定义 API：持久化保存多个 OpenAI 兼容接口，可勾选多个接口顺序测速
 - 接口类型：支持 Chat Completions、Responses API 和 Legacy Completions，按类型生成请求体并解析流式事件
 - 基础 URL：只需填写例如 `https://api.example.com/v1`，自动补全具体接口路径；可从 `/v1/models` 自动获取模型
-- 自定义测速：比较成功率、平均首响应、平均总耗时、耗时波动和 Tokens/s，并标出最快与最稳定接口
+- 自定义测速：比较成功率、平均首响应、平均总耗时、耗时波动、Tokens/s 和缓存命中率，并标出最快与最稳定接口
 - API Key 安全：支持 Bearer、`x-api-key` 和无鉴权；Key 使用 Windows DPAPI 加密，不明文写入配置或显示在界面中
 
 配置保存前会备份为 `~/.codex/config.toml.codex-agent-console.bak`。控制台只增删全局 `AGENTS.md` 或 `AGENTS.override.md` 中自己带标记的协调策略，不会覆盖已有的用户规则；旧版本写入 `developer_instructions` 的标记会自动迁移清除。点击“立即应用到 Desktop”后，程序只重载经过路径、命令行和父进程校验的 Desktop `app-server`，不会关闭 Desktop 窗口；运行中的任务会中断，已有任务不会热切换，新任务会使用新设置。未检测到 Desktop 时，设置会在下次启动或新建任务时加载。
@@ -47,6 +47,8 @@ Codex 官方订阅使用 ChatGPT 登录，不是可粘贴到 HTTP 接口中的 A
 “自定义 API”用于独立购买的 OpenAI Platform API Key、第三方兼容 API 或自建服务。点击“新增 API”，填写名称、基础 URL、接口类型和鉴权方式；点击“获取模型”即可从兼容的 `/v1/models` 接口读取模型，再保存并测速。例如基础 URL 可以填写 `https://api.openai.com/v1`，程序会根据所选类型使用 `/chat/completions`、`/responses` 或 `/completions`。其 API 用量和 Codex/ChatGPT 订阅分开计费。
 
 默认执行 3 次以计算稳定性。测试按 API 顺序逐个执行，避免并发抢占本机带宽影响比较；每次都会产生对应服务的实际 Token 消耗。远程接口必须使用 HTTPS，只有 localhost 可使用 HTTP。
+
+勾选“缓存命中测试”后，每个 API 每轮会连续请求两次相同的约 2K Token 输入：第一条用于预热，第二条用于读取缓存命中率。明细会保留预热和检测结果，对比表只汇总检测请求。仅当服务端在 `usage` 中返回输入 Token 和缓存输入 Token 时显示命中率；没有这些字段的兼容接口显示 `--`。
 
 ## 系统要求
 

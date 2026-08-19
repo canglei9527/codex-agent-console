@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.9 - 2026-08-19
+
+- Add an opt-in custom API cache-hit benchmark with a cache warmup request, a repeated measurement request, and cache-hit reporting when the provider exposes input usage.
+- Correct execution-agent Token totals for forked sessions that embed a primary-session usage history, while preserving clean forked-session totals.
+
 ## 1.3.8 - 2026-08-19
 
 - Fix the “Today” Token filter to start at the local computer's midnight instead of including the previous 24 hours of sessions.

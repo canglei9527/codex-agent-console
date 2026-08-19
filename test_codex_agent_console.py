@@ -19,6 +19,7 @@ from codex_agent_console import (
     CustomApiEndpoint,
     CustomApiResult,
     CustomApiStore,
+    CUSTOM_API_CACHE_PROMPT,
     CUSTOM_API_PROMPT,
     DiagnosticResult,
     DUAL_MODE_POLICY_START,
@@ -469,6 +470,234 @@ class SessionStatsTests(unittest.TestCase):
                 datetime.fromisoformat(child_started),
             )
 
+    def test_excludes_parent_token_history_from_forked_execution_subagent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp)
+            now = datetime.now(timezone.utc)
+            child_started = now.isoformat()
+            parent_started = (now - timedelta(seconds=5)).isoformat()
+
+            def token_record(total: dict[str, int]) -> dict:
+                return {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": total},
+                    },
+                }
+
+            records = [
+                {
+                    "timestamp": child_started,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "execution-child",
+                        "forked_from_id": "main-parent",
+                        "timestamp": child_started,
+                        "thread_source": "subagent",
+                        "source": {
+                            "subagent": {
+                                "thread_spawn": {
+                                    "agent_role": "codex_agent_console_executor"
+                                }
+                            }
+                        },
+                    },
+                },
+                {
+                    "timestamp": parent_started,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "main-parent",
+                        "timestamp": parent_started,
+                        "thread_source": "user",
+                    },
+                },
+                {
+                    "timestamp": parent_started,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.6-terra", "effort": "max"},
+                },
+                token_record(
+                    {
+                        "input_tokens": 90,
+                        "cached_input_tokens": 50,
+                        "cache_write_input_tokens": 2,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 100,
+                    }
+                ),
+                token_record(
+                    {
+                        "input_tokens": 130,
+                        "cached_input_tokens": 80,
+                        "cache_write_input_tokens": 3,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 9,
+                        "total_tokens": 150,
+                    }
+                ),
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "model": "gpt-5.5",
+                            "reasoning_effort": "xhigh",
+                        },
+                    },
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+                },
+                token_record(
+                    {
+                        "input_tokens": 160,
+                        "cached_input_tokens": 100,
+                        "cache_write_input_tokens": 4,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 10,
+                        "total_tokens": 180,
+                    }
+                ),
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {"type": "task_complete"},
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "event_msg",
+                    "payload": {"type": "task_started"},
+                },
+                {
+                    "timestamp": child_started,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+                },
+                token_record(
+                    {
+                        "input_tokens": 220,
+                        "cached_input_tokens": 140,
+                        "cache_write_input_tokens": 7,
+                        "output_tokens": 40,
+                        "reasoning_output_tokens": 20,
+                        "total_tokens": 260,
+                    }
+                ),
+            ]
+            execution_path = sessions / "execution.jsonl"
+            execution_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+            self._write_session(
+                sessions / "direct-subagent.jsonl",
+                "subagent",
+                [
+                    {
+                        "input_tokens": 50,
+                        "cached_input_tokens": 25,
+                        "output_tokens": 10,
+                        "total_tokens": 60,
+                    }
+                ],
+            )
+            self._write_session(
+                sessions / "guardian.jsonl",
+                "subagent",
+                [{"input_tokens": 999, "total_tokens": 999}],
+                {"subagent": {"other": "guardian"}},
+            )
+
+            parsed = SessionStatsReader(sessions)._parse_file(execution_path)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(
+                parsed.tokens,
+                {
+                    "input_tokens": 90,
+                    "cached_input_tokens": 60,
+                    "cache_write_input_tokens": 4,
+                    "output_tokens": 20,
+                    "reasoning_output_tokens": 11,
+                    "total_tokens": 110,
+                },
+            )
+
+            _main, subagent = SessionStatsReader(sessions).aggregate(None)
+            self.assertEqual(subagent.sessions, 2)
+            self.assertEqual(subagent.input_tokens, 140)
+            self.assertEqual(subagent.cached_input_tokens, 85)
+            self.assertEqual(subagent.total_tokens, 170)
+
+    def test_keeps_clean_forked_execution_usage_without_parent_metadata(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp)
+            now = datetime.now(timezone.utc).isoformat()
+            records = [
+                {
+                    "timestamp": now,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "execution-child",
+                        "forked_from_id": "main-parent",
+                        "timestamp": now,
+                        "thread_source": "subagent",
+                    },
+                },
+                {
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_settings_applied",
+                        "thread_settings": {
+                            "model": "gpt-5.5",
+                            "reasoning_effort": "xhigh",
+                        },
+                    },
+                },
+                {
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 20}},
+                    },
+                },
+                {
+                    "timestamp": now,
+                    "type": "turn_context",
+                    "payload": {"model": "gpt-5.5", "effort": "xhigh"},
+                },
+                {
+                    "timestamp": now,
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 60}},
+                    },
+                },
+            ]
+            execution_path = sessions / "clean-execution.jsonl"
+            execution_path.write_text(
+                "".join(json.dumps(record) + "\n" for record in records),
+                encoding="utf-8",
+            )
+
+            parsed = SessionStatsReader(sessions)._parse_file(execution_path)
+            self.assertIsNotNone(parsed)
+            self.assertEqual(parsed.tokens["total_tokens"], 60)
+
     def test_today_uses_local_calendar_day_not_previous_24_hours(self):
         with tempfile.TemporaryDirectory() as temp:
             sessions = Path(temp)
@@ -760,7 +989,9 @@ class CustomApiTests(unittest.TestCase):
                 chunks = (
                     b'data: {"choices":[{"delta":{"content":"API"}}]}\n\n',
                     b'data: {"choices":[{"delta":{"content":"_OK"}}],'
-                    b'"usage":{"completion_tokens":2}}\n\n',
+                    b'"usage":{"prompt_tokens":2000,'
+                    b'"prompt_tokens_details":{"cached_tokens":1200},'
+                    b'"completion_tokens":2}}\n\n',
                     b"data: [DONE]\n\n",
                 )
                 for chunk in chunks:
@@ -796,8 +1027,79 @@ class CustomApiTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertTrue(results[0].success)
         self.assertEqual(results[0].output_tokens, 2)
+        self.assertEqual(results[0].input_tokens, 2000)
+        self.assertEqual(results[0].cached_input_tokens, 1200)
+        self.assertEqual(results[0].cache_hit_rate, 60.0)
         self.assertFalse(results[0].tokens_estimated)
         self.assertIsNotNone(results[0].first_response_seconds)
+
+    def test_cache_benchmark_warms_then_measures_a_reused_prompt(self):
+        class Handler(BaseHTTPRequestHandler):
+            payloads: list[dict[str, object]] = []
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                Handler.payloads.append(
+                    json.loads(self.rfile.read(length).decode("utf-8"))
+                )
+                cached_tokens = 0 if len(Handler.payloads) == 1 else 1800
+                body = json.dumps(
+                    {
+                        "choices": [{"message": {"content": "API_OK"}}],
+                        "usage": {
+                            "prompt_tokens": 2000,
+                            "prompt_tokens_details": {
+                                "cached_tokens": cached_tokens
+                            },
+                            "completion_tokens": 2,
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = CustomApiEndpoint(
+                "cache",
+                "Cache",
+                f"http://127.0.0.1:{server.server_port}/v1/chat/completions",
+                "test-model",
+            )
+            results: list[CustomApiResult] = []
+            CustomApiBenchmarkRunner().run(
+                [(endpoint, "")],
+                1,
+                10.0,
+                lambda _event: None,
+                results.append,
+                cache_test=True,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(Handler.payloads), 2)
+        self.assertEqual(Handler.payloads[0], Handler.payloads[1])
+        self.assertEqual(
+            Handler.payloads[0]["messages"][0]["content"],
+            CUSTOM_API_CACHE_PROMPT,
+        )
+        self.assertFalse(Handler.payloads[0]["stream"])
+        self.assertEqual([result.cache_phase for result in results], ["warmup", "measure"])
+        self.assertEqual(results[0].cache_hit_rate, 0.0)
+        self.assertEqual(results[1].cache_hit_rate, 90.0)
+        summary = summarize_custom_apis(results)[0]
+        self.assertEqual(summary.total, 1)
+        self.assertEqual(summary.cache_hit_rate, 90.0)
 
     def test_responses_streaming_benchmark_parses_response_events(self):
         class Handler(BaseHTTPRequestHandler):
@@ -817,7 +1119,9 @@ class CustomApiTests(unittest.TestCase):
                     b"event: response.output_text.delta\n\n"
                     b'data: {"type":"response.output_text.delta","delta":"_OK"}\n\n',
                     b"event: response.completed\n\n"
-                    b'data: {"type":"response.completed","response":{"usage":{"output_tokens":2}}}\n\n',
+                    b'data: {"type":"response.completed","response":{"usage":'
+                    b'{"input_tokens":1600,"input_tokens_details":'
+                    b'{"cached_tokens":1280},"output_tokens":2}}}\n\n',
                 )
                 for chunk in chunks:
                     self.wfile.write(chunk)
@@ -854,6 +1158,9 @@ class CustomApiTests(unittest.TestCase):
         self.assertTrue(results[0].success)
         self.assertEqual(results[0].api_type, "responses")
         self.assertEqual(results[0].output_tokens, 2)
+        self.assertEqual(results[0].input_tokens, 1600)
+        self.assertEqual(results[0].cached_input_tokens, 1280)
+        self.assertEqual(results[0].cache_hit_rate, 80.0)
         self.assertFalse(results[0].tokens_estimated)
 
 

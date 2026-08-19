@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.8"
+APP_VERSION = "1.3.9"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -40,6 +40,12 @@ DIAGNOSTIC_PROMPT = (
 )
 CUSTOM_API_CONFIG_NAME = "codex-agent-console-apis.json"
 CUSTOM_API_PROMPT = "Reply with exactly API_OK and nothing else."
+CUSTOM_API_CACHE_PROMPT = (
+    "Cache benchmark reference text. Reuse this exact request prefix for a "
+    "deterministic prompt-cache measurement. "
+    * 160
+    + "\n\nReply with exactly API_OK and nothing else."
+)
 CUSTOM_API_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
 CUSTOM_API_MODELS_SUFFIX = "/models"
 CUSTOM_API_AUTH_MODES = ("bearer", "x-api-key", "none")
@@ -709,6 +715,29 @@ def _safe_token_count(value: object) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+_CUMULATIVE_TOKEN_USAGE_FIELDS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_write_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
+
+
+def _cumulative_token_delta(
+    latest: dict[str, object], baseline: dict[str, object]
+) -> dict[str, int]:
+    return {
+        name: max(
+            0,
+            _safe_token_count(latest.get(name))
+            - _safe_token_count(baseline.get(name)),
+        )
+        for name in _CUMULATIVE_TOKEN_USAGE_FIELDS
+    }
 
 
 def normalize_token_usage(value: object) -> dict[str, int]:
@@ -1492,6 +1521,16 @@ class CustomApiResult:
     tokens_per_second: float = 0.0
     error: str = ""
     api_type: str = "chat_completions"
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    input_tokens_reported: bool = False
+    cache_phase: str = ""
+
+    @property
+    def cache_hit_rate(self) -> float | None:
+        if not self.input_tokens_reported or self.input_tokens <= 0:
+            return None
+        return self.cached_input_tokens * 100.0 / self.input_tokens
 
 
 @dataclass(frozen=True)
@@ -1507,6 +1546,9 @@ class CustomApiSummary:
     jitter_percent: float | None
     average_tokens_per_second: float | None
     api_type: str = "chat_completions"
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_hit_rate: float | None = None
 
 
 def summarize_custom_apis(
@@ -1515,6 +1557,8 @@ def summarize_custom_apis(
     grouped: dict[str, list[CustomApiResult]] = {}
     order: list[str] = []
     for result in results:
+        if result.cache_phase == "warmup":
+            continue
         if result.endpoint_id not in grouped:
             grouped[result.endpoint_id] = []
             order.append(result.endpoint_id)
@@ -1535,6 +1579,13 @@ def summarize_custom_apis(
             for result in successes
             if result.output_tokens > 0
         ]
+        usage_results = [
+            result for result in successes if result.input_tokens_reported
+        ]
+        input_tokens = sum(result.input_tokens for result in usage_results)
+        cached_input_tokens = sum(
+            result.cached_input_tokens for result in usage_results
+        )
         average_total = (
             sum(total_values) / len(total_values) if total_values else None
         )
@@ -1567,6 +1618,13 @@ def summarize_custom_apis(
                     else None
                 ),
                 api_type=sample.api_type,
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                cache_hit_rate=(
+                    cached_input_tokens * 100.0 / input_tokens
+                    if input_tokens > 0
+                    else None
+                ),
             )
         )
     return summaries
@@ -1655,16 +1713,78 @@ def _extract_custom_api_content(
     return str(choice.get("text") or "")
 
 
-def _extract_custom_api_output_tokens(
+def _extract_custom_api_usage(
     value: object, api_type: str = "chat_completions"
-) -> int:
+) -> dict[str, object] | None:
     if not isinstance(value, dict):
-        return 0
+        return None
     usage = value.get("usage")
     if not isinstance(usage, dict) and api_type == "responses":
         response = value.get("response")
         usage = response.get("usage") if isinstance(response, dict) else None
-    if not isinstance(usage, dict):
+    return usage if isinstance(usage, dict) else None
+
+
+def _first_custom_api_usage_value(
+    usage: dict[str, object], names: tuple[str, ...]
+) -> object | None:
+    for name in names:
+        value = usage.get(name)
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_custom_api_input_usage(
+    value: object, api_type: str = "chat_completions"
+) -> tuple[int, int, bool]:
+    usage = _extract_custom_api_usage(value, api_type)
+    if usage is None:
+        return 0, 0, False
+
+    raw_input = _first_custom_api_usage_value(
+        usage, ("input_tokens", "prompt_tokens")
+    )
+    input_reported = raw_input is not None
+    input_tokens = _safe_token_count(raw_input)
+    details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("prompt_tokens_details")
+    cached_value = (
+        _first_custom_api_usage_value(details, ("cached_tokens",))
+        if isinstance(details, dict)
+        else None
+    )
+    cache_read_is_separate = False
+    if cached_value is None:
+        cached_value = _first_custom_api_usage_value(
+            usage,
+            (
+                "cached_input_tokens",
+                "cached_tokens",
+                "cache_hit_tokens",
+                "prompt_cache_hit_tokens",
+                "cache_read_input_tokens",
+            ),
+        )
+        cache_read_is_separate = (
+            _first_custom_api_usage_value(
+                usage, ("cache_read_input_tokens",)
+            )
+            is not None
+        )
+    cached_input_tokens = _safe_token_count(cached_value)
+    if cache_read_is_separate and cached_input_tokens:
+        input_tokens += cached_input_tokens
+        input_reported = True
+    return input_tokens, cached_input_tokens, input_reported
+
+
+def _extract_custom_api_output_tokens(
+    value: object, api_type: str = "chat_completions"
+) -> int:
+    usage = _extract_custom_api_usage(value, api_type)
+    if usage is None:
         return 0
     return _safe_token_count(
         usage.get("completion_tokens") or usage.get("output_tokens")
@@ -1782,37 +1902,43 @@ class CustomApiBenchmarkRunner:
         timeout_seconds: float,
         on_progress: Callable[[dict[str, object]], None],
         on_result: Callable[[CustomApiResult], None],
+        cache_test: bool = False,
     ) -> None:
         try:
             for attempt in range(1, attempts + 1):
                 for endpoint, api_key in cases:
-                    if self._cancel.is_set():
-                        return
-                    try:
-                        result = self._run_one(
-                            endpoint,
-                            api_key,
-                            attempt,
-                            timeout_seconds,
-                            on_progress,
-                        )
-                    except Exception as exc:
-                        result = CustomApiResult(
-                            endpoint_id=endpoint.endpoint_id,
-                            name=endpoint.name,
-                            model=endpoint.model,
-                            attempt=attempt,
-                            success=False,
-                            status="测速器异常",
-                            http_status=None,
-                            first_response_seconds=None,
-                            total_seconds=0.0,
-                            error=str(exc).replace(api_key, "[REDACTED]")
-                            if api_key
-                            else str(exc),
-                            api_type=endpoint.api_type,
-                        )
-                    on_result(result)
+                    phases = ("warmup", "measure") if cache_test else ("",)
+                    for cache_phase in phases:
+                        if self._cancel.is_set():
+                            return
+                        try:
+                            result = self._run_one(
+                                endpoint,
+                                api_key,
+                                attempt,
+                                timeout_seconds,
+                                on_progress,
+                                cache_test,
+                                cache_phase,
+                            )
+                        except Exception as exc:
+                            result = CustomApiResult(
+                                endpoint_id=endpoint.endpoint_id,
+                                name=endpoint.name,
+                                model=endpoint.model,
+                                attempt=attempt,
+                                success=False,
+                                status="测速器异常",
+                                http_status=None,
+                                first_response_seconds=None,
+                                total_seconds=0.0,
+                                error=str(exc).replace(api_key, "[REDACTED]")
+                                if api_key
+                                else str(exc),
+                                api_type=endpoint.api_type,
+                                cache_phase=cache_phase,
+                            )
+                        on_result(result)
         finally:
             on_progress(
                 {"phase": "finished", "cancelled": self._cancel.is_set()}
@@ -1825,24 +1951,28 @@ class CustomApiBenchmarkRunner:
         attempt: int,
         timeout_seconds: float,
         on_progress: Callable[[dict[str, object]], None],
+        cache_test: bool = False,
+        cache_phase: str = "",
     ) -> CustomApiResult:
+        prompt = CUSTOM_API_CACHE_PROMPT if cache_test else CUSTOM_API_PROMPT
+        stream = not cache_test
         if endpoint.api_type == "responses":
             payload_value = {
                 "model": endpoint.model,
-                "input": CUSTOM_API_PROMPT,
-                "stream": True,
+                "input": prompt,
+                "stream": stream,
             }
         elif endpoint.api_type == "completions":
             payload_value = {
                 "model": endpoint.model,
-                "prompt": CUSTOM_API_PROMPT,
-                "stream": True,
+                "prompt": prompt,
+                "stream": stream,
             }
         else:
             payload_value = {
                 "model": endpoint.model,
-                "messages": [{"role": "user", "content": CUSTOM_API_PROMPT}],
-                "stream": True,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": stream,
             }
         payload = json.dumps(payload_value, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -1864,6 +1994,9 @@ class CustomApiBenchmarkRunner:
         http_status: int | None = None
         output_parts: list[str] = []
         output_tokens = 0
+        input_tokens = 0
+        cached_input_tokens = 0
+        input_tokens_reported = False
         content_events = 0
         plain_body: list[bytes] = []
         response = None
@@ -1900,6 +2033,17 @@ class CustomApiBenchmarkRunner:
                         output_tokens,
                         _extract_custom_api_output_tokens(event, endpoint.api_type),
                     )
+                    (
+                        event_input_tokens,
+                        event_cached_input_tokens,
+                        event_input_reported,
+                    ) = _extract_custom_api_input_usage(event, endpoint.api_type)
+                    if event_input_reported:
+                        input_tokens = max(input_tokens, event_input_tokens)
+                        cached_input_tokens = max(
+                            cached_input_tokens, event_cached_input_tokens
+                        )
+                        input_tokens_reported = True
                 elif line.startswith(("event:", "id:", "retry:")):
                     continue
                 else:
@@ -1918,6 +2062,10 @@ class CustomApiBenchmarkRunner:
                         "output_tokens": live_tokens,
                         "tokens_per_second": live_tokens / generation_seconds,
                         "estimated": output_tokens == 0,
+                        "input_tokens": input_tokens,
+                        "cached_input_tokens": cached_input_tokens,
+                        "input_tokens_reported": input_tokens_reported,
+                        "cache_phase": cache_phase,
                     }
                 )
 
@@ -1932,6 +2080,17 @@ class CustomApiBenchmarkRunner:
                     output_tokens,
                     _extract_custom_api_output_tokens(parsed, endpoint.api_type),
                 )
+                (
+                    body_input_tokens,
+                    body_cached_input_tokens,
+                    body_input_reported,
+                ) = _extract_custom_api_input_usage(parsed, endpoint.api_type)
+                if body_input_reported:
+                    input_tokens = max(input_tokens, body_input_tokens)
+                    cached_input_tokens = max(
+                        cached_input_tokens, body_cached_input_tokens
+                    )
+                    input_tokens_reported = True
             response.close()
             with self._response_lock:
                 self._response = None
@@ -1963,6 +2122,10 @@ class CustomApiBenchmarkRunner:
                 tokens_estimated=estimated,
                 tokens_per_second=output_tokens / speed_seconds,
                 api_type=endpoint.api_type,
+                input_tokens=input_tokens,
+                cached_input_tokens=cached_input_tokens,
+                input_tokens_reported=input_tokens_reported,
+                cache_phase=cache_phase,
             )
         except urllib.error.HTTPError as exc:
             http_status = exc.code
@@ -2005,6 +2168,7 @@ class CustomApiBenchmarkRunner:
             total_seconds=total_seconds,
             error=message,
             api_type=endpoint.api_type,
+            cache_phase=cache_phase,
         )
 
 
@@ -2029,6 +2193,13 @@ class SessionStatsReader:
         is_subagent = False
         is_execution_subagent = False
         latest_tokens: dict[str, object] | None = None
+        token_snapshots: list[tuple[int, dict[str, object]]] = []
+        settings_events: list[tuple[int, str, str]] = []
+        turn_context_events: list[tuple[int, str, str]] = []
+        execution_session_id = ""
+        execution_session_meta_seen = False
+        has_embedded_parent_history = False
+        record_index = 0
         model = ""
         reasoning_effort = ""
         try:
@@ -2041,6 +2212,7 @@ class SessionStatsReader:
                     payload = item.get("payload") if isinstance(item, dict) else None
                     if not isinstance(payload, dict):
                         continue
+                    record_index += 1
                     if item.get("type") == "session_meta":
                         source = payload.get("source")
                         record_is_subagent = payload.get("thread_source") == "subagent" or (
@@ -2056,6 +2228,22 @@ class SessionStatsReader:
                         is_execution_subagent = is_execution_subagent or (
                             record_is_subagent and not is_system_subagent
                         )
+                        record_session_id = payload.get("id")
+                        if record_is_subagent and not is_system_subagent:
+                            if execution_session_meta_seen:
+                                has_embedded_parent_history = (
+                                    has_embedded_parent_history
+                                    or not execution_session_id
+                                    or not isinstance(record_session_id, str)
+                                    or record_session_id != execution_session_id
+                                )
+                            else:
+                                execution_session_meta_seen = True
+                                if isinstance(record_session_id, str):
+                                    execution_session_id = record_session_id
+                        elif execution_session_meta_seen:
+                            # Forked logs prepend the parent's session metadata and counters.
+                            has_embedded_parent_history = True
                         stamp = payload.get("timestamp") or item.get("timestamp")
                         if isinstance(stamp, str):
                             try:
@@ -2072,6 +2260,16 @@ class SessionStatsReader:
                         model = payload["model"]
                     if isinstance(payload.get("effort"), str):
                         reasoning_effort = payload["effort"]
+                    if item.get("type") == "turn_context":
+                        context_model = payload.get("model")
+                        context_effort = payload.get("effort")
+                        turn_context_events.append(
+                            (
+                                record_index,
+                                context_model if isinstance(context_model, str) else "",
+                                context_effort if isinstance(context_effort, str) else "",
+                            )
+                        )
                     collaboration = payload.get("collaboration_mode")
                     settings = (
                         collaboration.get("settings")
@@ -2088,15 +2286,53 @@ class SessionStatsReader:
                             model = thread_settings["model"]
                         if isinstance(thread_settings.get("reasoning_effort"), str):
                             reasoning_effort = thread_settings["reasoning_effort"]
+                    if payload.get("type") == "thread_settings_applied":
+                        settings_events.append(
+                            (
+                                record_index,
+                                thread_settings.get("model")
+                                if isinstance(thread_settings, dict)
+                                and isinstance(thread_settings.get("model"), str)
+                                else "",
+                                thread_settings.get("reasoning_effort")
+                                if isinstance(thread_settings, dict)
+                                and isinstance(thread_settings.get("reasoning_effort"), str)
+                                else "",
+                            )
+                        )
                     if payload.get("type") == "token_count":
                         info = payload.get("info")
                         total = info.get("total_token_usage") if isinstance(info, dict) else None
                         if isinstance(total, dict):
                             latest_tokens = total
+                            token_snapshots.append((record_index, total))
         except OSError:
             return None
         if latest_tokens is None:
             return None
+        if is_execution_subagent and has_embedded_parent_history and settings_events:
+            settings_index, settings_model, settings_effort = settings_events[-1]
+            execution_turn_index = next(
+                (
+                    context_index
+                    for context_index, context_model, context_effort in turn_context_events
+                    if context_index > settings_index
+                    and (not settings_model or context_model == settings_model)
+                    and (not settings_effort or context_effort == settings_effort)
+                ),
+                None,
+            )
+            if execution_turn_index is not None:
+                baseline = next(
+                    (
+                        token_data
+                        for snapshot_index, token_data in reversed(token_snapshots)
+                        if snapshot_index < execution_turn_index
+                    ),
+                    None,
+                )
+                if baseline is not None:
+                    latest_tokens = _cumulative_token_delta(latest_tokens, baseline)
         if subagent_started_at is not None:
             started_at = subagent_started_at
         if started_at is None:
@@ -3074,8 +3310,8 @@ class CodexAgentConsole:
         window = tk.Toplevel(self.root)
         self._custom_api_window = window
         window.title(f"自定义 API 测速 · {APP_NAME} {APP_VERSION}")
-        window.geometry("1280x820")
-        window.minsize(980, 680)
+        window.geometry("1380x820")
+        window.minsize(1080, 680)
         window.configure(bg="#111418")
         window.protocol("WM_DELETE_WINDOW", self._close_custom_api)
 
@@ -3181,6 +3417,13 @@ class CodexAgentConsole:
             width=7,
         )
         self.custom_api_timeout_spin.pack(side="left", padx=(8, 18))
+        self.custom_api_cache_test_var = tk.BooleanVar(value=False)
+        self.custom_api_cache_test_check = ttk.Checkbutton(
+            controls,
+            text="缓存命中测试",
+            variable=self.custom_api_cache_test_var,
+        )
+        self.custom_api_cache_test_check.pack(side="left", padx=(0, 18))
         self.custom_api_start_button = ttk.Button(
             controls,
             text="开始测速",
@@ -3234,7 +3477,16 @@ class CodexAgentConsole:
         ).pack(side="left", padx=8)
         self.custom_api_compare_tree = ttk.Treeview(
             comparison_panel,
-            columns=("name", "model", "success", "first", "total", "jitter", "speed"),
+            columns=(
+                "name",
+                "model",
+                "success",
+                "first",
+                "total",
+                "jitter",
+                "cache",
+                "speed",
+            ),
             show="headings",
             height=4,
         )
@@ -3245,6 +3497,7 @@ class CodexAgentConsole:
             "first": "平均首响应",
             "total": "平均总耗时",
             "jitter": "耗时波动",
+            "cache": "缓存命中",
             "speed": "Tokens/s",
         }
         compare_widths = {
@@ -3254,6 +3507,7 @@ class CodexAgentConsole:
             "first": 110,
             "total": 110,
             "jitter": 100,
+            "cache": 110,
             "speed": 100,
         }
         for name in self.custom_api_compare_tree["columns"]:
@@ -3289,6 +3543,7 @@ class CodexAgentConsole:
                 "first",
                 "total",
                 "output",
+                "cache",
                 "speed",
                 "error",
             ),
@@ -3304,6 +3559,7 @@ class CodexAgentConsole:
             "first": "首响应",
             "total": "总耗时",
             "output": "输出",
+            "cache": "缓存命中",
             "speed": "Tokens/s",
             "error": "错误详情",
         }
@@ -3316,6 +3572,7 @@ class CodexAgentConsole:
             "first": 82,
             "total": 82,
             "output": 80,
+            "cache": 136,
             "speed": 90,
             "error": 360,
         }
@@ -3673,6 +3930,7 @@ class CodexAgentConsole:
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"无法开始测速：{exc}")
             return
+        cache_test = bool(self.custom_api_cache_test_var.get())
         selected_endpoints = [
             endpoint for endpoint in self._custom_api_endpoints if endpoint.selected
         ]
@@ -3706,7 +3964,7 @@ class CodexAgentConsole:
         self.custom_api_fastest_var.set("最快：--")
         self.custom_api_stable_var.set("最稳定：--")
         self.custom_api_coverage_var.set(
-            f"完成：0/{len(cases) * attempts}"
+            f"完成：0/{len(cases) * attempts * (2 if cache_test else 1)}"
         )
         self._set_custom_api_running(True)
         runner = CustomApiBenchmarkRunner()
@@ -3728,7 +3986,14 @@ class CodexAgentConsole:
 
         threading.Thread(
             target=runner.run,
-            args=(cases, attempts, float(timeout_seconds), progress, result),
+            args=(
+                cases,
+                attempts,
+                float(timeout_seconds),
+                progress,
+                result,
+                cache_test,
+            ),
             daemon=True,
         ).start()
 
@@ -3739,6 +4004,9 @@ class CodexAgentConsole:
             state="disabled" if running else "readonly"
         )
         self.custom_api_timeout_spin.configure(
+            state="disabled" if running else "normal"
+        )
+        self.custom_api_cache_test_check.configure(
             state="disabled" if running else "normal"
         )
         self.custom_api_start_button.configure(
@@ -3767,12 +4035,24 @@ class CodexAgentConsole:
             return
         if payload.get("phase") == "running":
             estimated = "约 " if payload.get("estimated") else ""
+            cache_phase = {
+                "warmup": " · 预热",
+                "measure": " · 检测",
+            }.get(str(payload.get("cache_phase") or ""), "")
+            input_tokens = int(payload.get("input_tokens") or 0)
+            cached_input_tokens = int(payload.get("cached_input_tokens") or 0)
+            cache_usage = ""
+            if payload.get("input_tokens_reported") and input_tokens > 0:
+                cache_usage = (
+                    f" · 缓存 {cached_input_tokens * 100.0 / input_tokens:.1f}%"
+                )
             self.custom_api_live_var.set(
                 f"{payload.get('name')} · {payload.get('model')} · "
-                f"第 {payload.get('attempt')} 轮 · "
+                f"第 {payload.get('attempt')} 轮{cache_phase} · "
                 f"{float(payload.get('elapsed') or 0):.1f}s · "
                 f"输出 {estimated}{int(payload.get('output_tokens') or 0):,} · "
                 f"{float(payload.get('tokens_per_second') or 0):.1f} Tokens/s"
+                f"{cache_usage}"
             )
             return
         if payload.get("phase") == "finished":
@@ -3793,13 +4073,24 @@ class CodexAgentConsole:
         error = " ".join(result.error.split())
         if len(error) > 220:
             error = error[:217] + "..."
+        attempt = str(result.attempt)
+        if result.cache_phase == "warmup":
+            attempt += " · 预热"
+        elif result.cache_phase == "measure":
+            attempt += " · 检测"
+        cache_hit = (
+            f"{result.cache_hit_rate:.1f}% "
+            f"({result.cached_input_tokens:,}/{result.input_tokens:,})"
+            if result.cache_hit_rate is not None
+            else "--"
+        )
         item_id = self.custom_api_detail_tree.insert(
             "",
             "end",
             values=(
                 result.name,
                 f"{custom_api_type_label(result.api_type)} · {result.model}",
-                result.attempt,
+                attempt,
                 result.status,
                 result.http_status or "--",
                 (
@@ -3809,6 +4100,7 @@ class CodexAgentConsole:
                 ),
                 f"{result.total_seconds:.2f}s",
                 f"{'~' if result.tokens_estimated else ''}{result.output_tokens:,}",
+                cache_hit,
                 f"{result.tokens_per_second:.1f}",
                 error,
             ),
@@ -3863,6 +4155,11 @@ class CodexAgentConsole:
                         f"{summary.jitter_percent:.1f}%"
                         if summary.jitter_percent is not None
                         else "需多次"
+                    ),
+                    (
+                        f"{summary.cache_hit_rate:.1f}%"
+                        if summary.cache_hit_rate is not None
+                        else "--"
                     ),
                     (
                         f"{summary.average_tokens_per_second:.1f}"
