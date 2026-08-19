@@ -12,6 +12,7 @@ from pathlib import Path
 
 from codex_agent_console import (
     AgentSettings,
+    ANTHROPIC_API_VERSION,
     ConfigStore,
     DesktopBackendProcess,
     DesktopBackendReloader,
@@ -872,6 +873,12 @@ class CustomApiTests(unittest.TestCase):
             custom_api_endpoint_url("https://api.example.com", "completions"),
             "https://api.example.com/v1/completions",
         )
+        self.assertEqual(
+            custom_api_endpoint_url(
+                "https://api.anthropic.com/v1", "anthropic_messages"
+            ),
+            "https://api.anthropic.com/v1/messages",
+        )
 
     def test_fetch_models_uses_models_endpoint_and_auth(self):
         class Handler(BaseHTTPRequestHandler):
@@ -908,6 +915,46 @@ class CustomApiTests(unittest.TestCase):
         self.assertEqual(Handler.path, "/v1/models")
         self.assertEqual(Handler.authorization, "Bearer test-model-key")
         self.assertEqual(models, ["alpha", "beta"])
+
+    def test_fetch_claude_models_uses_anthropic_headers(self):
+        class Handler(BaseHTTPRequestHandler):
+            api_key = ""
+            version = ""
+            path = ""
+
+            def do_GET(self):
+                Handler.api_key = self.headers.get("x-api-key", "")
+                Handler.version = self.headers.get("anthropic-version", "")
+                Handler.path = self.path
+                body = json.dumps(
+                    {"data": [{"id": "claude-sonnet"}, {"id": "claude-haiku"}]}
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            models = fetch_custom_api_models(
+                f"http://127.0.0.1:{server.server_port}/v1",
+                "x-api-key",
+                "test-anthropic-key",
+                api_type="anthropic_messages",
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        self.assertEqual(Handler.path, "/v1/models")
+        self.assertEqual(Handler.api_key, "test-anthropic-key")
+        self.assertEqual(Handler.version, ANTHROPIC_API_VERSION)
+        self.assertEqual(models, ["claude-sonnet", "claude-haiku"])
 
     @unittest.skipUnless(sys.platform == "win32", "Windows DPAPI only")
     def test_dpapi_round_trip_and_store_does_not_write_plaintext_key(self):
@@ -1100,6 +1147,161 @@ class CustomApiTests(unittest.TestCase):
         summary = summarize_custom_apis(results)[0]
         self.assertEqual(summary.total, 1)
         self.assertEqual(summary.cache_hit_rate, 90.0)
+
+    def test_claude_messages_streaming_benchmark_parses_sse_and_usage(self):
+        class Handler(BaseHTTPRequestHandler):
+            headers = {}
+            payload = {}
+
+            def do_POST(self):
+                Handler.headers = dict(self.headers.items())
+                length = int(self.headers.get("Content-Length", "0"))
+                Handler.payload = json.loads(self.rfile.read(length).decode("utf-8"))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunks = (
+                    b"event: message_start\n\n"
+                    b'data: {"type":"message_start","message":{"usage":'
+                    b'{"input_tokens":120,"cache_creation_input_tokens":0,'
+                    b'"cache_read_input_tokens":0}}}\n\n',
+                    b"event: content_block_start\n\n"
+                    b'data: {"type":"content_block_start","content_block":'
+                    b'{"type":"text","text":""}}\n\n',
+                    b"event: content_block_delta\n\n"
+                    b'data: {"type":"content_block_delta","delta":'
+                    b'{"type":"text_delta","text":"API"}}\n\n',
+                    b"event: content_block_delta\n\n"
+                    b'data: {"type":"content_block_delta","delta":'
+                    b'{"type":"text_delta","text":"_OK"}}\n\n',
+                    b"event: message_delta\n\n"
+                    b'data: {"type":"message_delta","usage":{"output_tokens":3}}\n\n',
+                    b"event: message_stop\n\n"
+                    b'data: {"type":"message_stop"}\n\n',
+                )
+                for chunk in chunks:
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = CustomApiEndpoint(
+                "claude",
+                "Claude",
+                f"http://127.0.0.1:{server.server_port}/v1/messages",
+                "claude-sonnet",
+                auth_mode="x-api-key",
+                api_type="anthropic_messages",
+            )
+            results: list[CustomApiResult] = []
+            CustomApiBenchmarkRunner().run(
+                [(endpoint, "test-claude-key")],
+                1,
+                10.0,
+                lambda _event: None,
+                results.append,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        headers = {key.casefold(): value for key, value in Handler.headers.items()}
+        self.assertEqual(headers["x-api-key"], "test-claude-key")
+        self.assertEqual(headers["anthropic-version"], ANTHROPIC_API_VERSION)
+        self.assertNotIn("authorization", headers)
+        self.assertEqual(Handler.payload["max_tokens"], 16)
+        self.assertTrue(Handler.payload["stream"])
+        self.assertEqual(Handler.payload["messages"][0]["role"], "user")
+        self.assertEqual(len(results), 1)
+        self.assertTrue(results[0].success)
+        self.assertEqual(results[0].api_type, "anthropic_messages")
+        self.assertEqual(results[0].output_tokens, 3)
+        self.assertEqual(results[0].input_tokens, 120)
+        self.assertEqual(results[0].cached_input_tokens, 0)
+
+    def test_claude_cache_benchmark_uses_cache_control_and_reads_cache_usage(self):
+        class Handler(BaseHTTPRequestHandler):
+            payloads: list[dict[str, object]] = []
+            headers: list[dict[str, str]] = []
+
+            def do_POST(self):
+                Handler.headers.append(dict(self.headers.items()))
+                length = int(self.headers.get("Content-Length", "0"))
+                Handler.payloads.append(
+                    json.loads(self.rfile.read(length).decode("utf-8"))
+                )
+                is_warmup = len(Handler.payloads) == 1
+                body = json.dumps(
+                    {
+                        "id": "msg_test",
+                        "type": "message",
+                        "content": [{"type": "text", "text": "API_OK"}],
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_creation_input_tokens": 1900 if is_warmup else 0,
+                            "cache_read_input_tokens": 0 if is_warmup else 1900,
+                            "output_tokens": 2,
+                        },
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, _format, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            endpoint = CustomApiEndpoint(
+                "claude-cache",
+                "Claude Cache",
+                f"http://127.0.0.1:{server.server_port}/v1/messages",
+                "claude-sonnet",
+                auth_mode="x-api-key",
+                api_type="anthropic_messages",
+            )
+            results: list[CustomApiResult] = []
+            CustomApiBenchmarkRunner().run(
+                [(endpoint, "test-claude-key")],
+                1,
+                10.0,
+                lambda _event: None,
+                results.append,
+                cache_test=True,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertEqual(len(Handler.payloads), 2)
+        self.assertEqual(Handler.payloads[0], Handler.payloads[1])
+        self.assertFalse(Handler.payloads[0]["stream"])
+        content = Handler.payloads[0]["messages"][0]["content"]
+        self.assertEqual(content[0]["text"], CUSTOM_API_CACHE_PROMPT)
+        self.assertEqual(content[0]["cache_control"], {"type": "ephemeral"})
+        cache_headers = {
+            key.casefold(): value for key, value in Handler.headers[0].items()
+        }
+        self.assertEqual(
+            cache_headers["anthropic-beta"], "prompt-caching-2024-07-31"
+        )
+        self.assertEqual(results[0].input_tokens, 2000)
+        self.assertEqual(results[0].cache_hit_rate, 0.0)
+        self.assertEqual(results[1].input_tokens, 2000)
+        self.assertEqual(results[1].cached_input_tokens, 1900)
+        self.assertEqual(results[1].cache_hit_rate, 95.0)
+        summary = summarize_custom_apis(results)[0]
+        self.assertEqual(summary.cache_hit_rate, 95.0)
 
     def test_responses_streaming_benchmark_parses_response_events(self):
         class Handler(BaseHTTPRequestHandler):

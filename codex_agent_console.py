@@ -47,18 +47,27 @@ CUSTOM_API_CACHE_PROMPT = (
     + "\n\nReply with exactly API_OK and nothing else."
 )
 CUSTOM_API_CHAT_COMPLETIONS_SUFFIX = "/chat/completions"
+CUSTOM_API_ANTHROPIC_MESSAGES_SUFFIX = "/messages"
 CUSTOM_API_MODELS_SUFFIX = "/models"
+ANTHROPIC_API_VERSION = "2023-06-01"
 CUSTOM_API_AUTH_MODES = ("bearer", "x-api-key", "none")
-CUSTOM_API_TYPES = ("chat_completions", "responses", "completions")
+CUSTOM_API_TYPES = (
+    "chat_completions",
+    "responses",
+    "completions",
+    "anthropic_messages",
+)
 CUSTOM_API_TYPE_LABELS = {
     "chat_completions": "Chat Completions",
     "responses": "Responses API",
     "completions": "Legacy Completions",
+    "anthropic_messages": "Claude Messages (Anthropic)",
 }
 CUSTOM_API_TYPE_SUFFIXES = {
     "chat_completions": CUSTOM_API_CHAT_COMPLETIONS_SUFFIX,
     "responses": "/responses",
     "completions": "/completions",
+    "anthropic_messages": CUSTOM_API_ANTHROPIC_MESSAGES_SUFFIX,
 }
 MODELS = (
     "gpt-5.6-sol",
@@ -1664,6 +1673,26 @@ def _extract_custom_api_content(
 ) -> str:
     if not isinstance(value, dict):
         return ""
+    if api_type == "anthropic_messages":
+        event_type = value.get("type")
+        if event_type == "content_block_delta":
+            delta = value.get("delta")
+            return str(delta.get("text") or "") if isinstance(delta, dict) else ""
+        if event_type == "content_block_start":
+            content_block = value.get("content_block")
+            return (
+                str(content_block.get("text") or "")
+                if isinstance(content_block, dict)
+                else ""
+            )
+        content = value.get("content")
+        if isinstance(content, list):
+            return "".join(
+                str(item.get("text") or "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return str(value.get("text") or "")
     if api_type == "responses":
         event_type = value.get("type")
         if event_type == "response.output_text.delta":
@@ -1718,6 +1747,12 @@ def _extract_custom_api_usage(
 ) -> dict[str, object] | None:
     if not isinstance(value, dict):
         return None
+    if api_type == "anthropic_messages":
+        usage = value.get("usage")
+        if not isinstance(usage, dict):
+            message = value.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+        return usage if isinstance(usage, dict) else None
     usage = value.get("usage")
     if not isinstance(usage, dict) and api_type == "responses":
         response = value.get("response")
@@ -1743,7 +1778,12 @@ def _extract_custom_api_input_usage(
         return 0, 0, False
 
     raw_input = _first_custom_api_usage_value(
-        usage, ("input_tokens", "prompt_tokens")
+        usage,
+        (
+            "input_tokens",
+            "prompt_tokens",
+            "input_tokens_total",
+        ),
     )
     input_reported = raw_input is not None
     input_tokens = _safe_token_count(raw_input)
@@ -1756,6 +1796,23 @@ def _extract_custom_api_input_usage(
         else None
     )
     cache_read_is_separate = False
+    cache_creation_is_separate = False
+    cache_read_value = _first_custom_api_usage_value(
+        usage,
+        (
+            "cache_read_input_tokens",
+            "cache_read_input_tokens_total",
+        ),
+    )
+    cache_creation_value = _first_custom_api_usage_value(
+        usage,
+        (
+            "cache_creation_input_tokens",
+            "cache_creation_input_tokens_total",
+            "cache_write_input_tokens",
+            "cache_write_tokens",
+        ),
+    )
     if cached_value is None:
         cached_value = _first_custom_api_usage_value(
             usage,
@@ -1764,18 +1821,16 @@ def _extract_custom_api_input_usage(
                 "cached_tokens",
                 "cache_hit_tokens",
                 "prompt_cache_hit_tokens",
-                "cache_read_input_tokens",
             ),
         )
-        cache_read_is_separate = (
-            _first_custom_api_usage_value(
-                usage, ("cache_read_input_tokens",)
-            )
-            is not None
-        )
+        cache_read_is_separate = cache_read_value is not None
+        cache_creation_is_separate = cache_creation_value is not None
+        if cached_value is None and cache_read_value is not None:
+            cached_value = cache_read_value
     cached_input_tokens = _safe_token_count(cached_value)
-    if cache_read_is_separate and cached_input_tokens:
-        input_tokens += cached_input_tokens
+    if cache_read_is_separate or cache_creation_is_separate:
+        input_tokens += _safe_token_count(cache_read_value)
+        input_tokens += _safe_token_count(cache_creation_value)
         input_reported = True
     return input_tokens, cached_input_tokens, input_reported
 
@@ -1787,7 +1842,9 @@ def _extract_custom_api_output_tokens(
     if usage is None:
         return 0
     return _safe_token_count(
-        usage.get("completion_tokens") or usage.get("output_tokens")
+        usage.get("completion_tokens")
+        or usage.get("output_tokens")
+        or usage.get("output_tokens_total")
     )
 
 
@@ -1806,12 +1863,19 @@ def _custom_api_error_status(message: str, http_status: int | None = None) -> st
     return "请求失败"
 
 
-def _custom_api_auth_headers(auth_mode: str, api_key: str) -> dict[str, str]:
+def _custom_api_auth_headers(
+    auth_mode: str,
+    api_key: str,
+    api_type: str = "chat_completions",
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
     if auth_mode == "bearer":
-        return {"Authorization": f"Bearer {api_key}"}
-    if auth_mode == "x-api-key":
-        return {"x-api-key": api_key}
-    return {}
+        headers["Authorization"] = f"Bearer {api_key}"
+    elif auth_mode == "x-api-key":
+        headers["x-api-key"] = api_key
+    if api_type == "anthropic_messages":
+        headers["anthropic-version"] = ANTHROPIC_API_VERSION
+    return headers
 
 
 def fetch_custom_api_models(
@@ -1819,16 +1883,17 @@ def fetch_custom_api_models(
     auth_mode: str,
     api_key: str,
     timeout_seconds: float = 15.0,
+    api_type: str = "chat_completions",
 ) -> list[str]:
-    """Fetch model IDs from an OpenAI-compatible /models endpoint."""
-    endpoint_url = custom_api_endpoint_url(base_url)
+    """Fetch model IDs from an OpenAI-compatible or Anthropic /models endpoint."""
+    endpoint_url = custom_api_endpoint_url(base_url, api_type)
     validate_custom_api_url(endpoint_url)
     request = urllib.request.Request(
         custom_api_models_url(base_url),
         headers={
             "Accept": "application/json",
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-            **_custom_api_auth_headers(auth_mode, api_key),
+            **_custom_api_auth_headers(auth_mode, api_key, api_type),
         },
         method="GET",
     )
@@ -1956,7 +2021,23 @@ class CustomApiBenchmarkRunner:
     ) -> CustomApiResult:
         prompt = CUSTOM_API_CACHE_PROMPT if cache_test else CUSTOM_API_PROMPT
         stream = not cache_test
-        if endpoint.api_type == "responses":
+        if endpoint.api_type == "anthropic_messages":
+            message_content: object = prompt
+            if cache_test:
+                message_content = [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            payload_value = {
+                "model": endpoint.model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": message_content}],
+                "stream": stream,
+            }
+        elif endpoint.api_type == "responses":
             payload_value = {
                 "model": endpoint.model,
                 "input": prompt,
@@ -1981,7 +2062,11 @@ class CustomApiBenchmarkRunner:
             "Connection": "close",
             "User-Agent": f"{APP_NAME}/{APP_VERSION}",
         }
-        headers.update(_custom_api_auth_headers(endpoint.auth_mode, api_key))
+        headers.update(
+            _custom_api_auth_headers(endpoint.auth_mode, api_key, endpoint.api_type)
+        )
+        if endpoint.api_type == "anthropic_messages" and cache_test:
+            headers["anthropic-beta"] = "prompt-caching-2024-07-31"
         request = urllib.request.Request(
             custom_api_endpoint_url(endpoint.url, endpoint.api_type),
             data=payload,
@@ -3712,6 +3797,7 @@ class CodexAgentConsole:
             value=custom_api_base_url(endpoint.url) if endpoint else ""
         )
         model_var = tk.StringVar(value=endpoint.model if endpoint else "")
+        initial_api_type = endpoint.api_type if endpoint else "chat_completions"
         api_type_var = tk.StringVar(
             value=custom_api_type_label(endpoint.api_type)
             if endpoint
@@ -3720,7 +3806,9 @@ class CodexAgentConsole:
         auth_var = tk.StringVar(
             value=self._custom_auth_label(endpoint.auth_mode)
             if endpoint
-            else "Bearer"
+            else self._custom_auth_label(
+                "x-api-key" if initial_api_type == "anthropic_messages" else "bearer"
+            )
         )
         key_var = tk.StringVar()
         model_status_var = tk.StringVar(
@@ -3741,6 +3829,20 @@ class CodexAgentConsole:
             state="readonly",
         )
         api_type_combo.grid(row=2, column=1, columnspan=2, sticky="ew", pady=8)
+
+        def selected_api_type() -> str:
+            return {
+                label: key for key, label in CUSTOM_API_TYPE_LABELS.items()
+            }.get(api_type_var.get(), "chat_completions")
+
+        def api_type_changed(_event: object = None) -> None:
+            if (
+                selected_api_type() == "anthropic_messages"
+                and auth_var.get() == "Bearer"
+            ):
+                auth_var.set("x-api-key")
+
+        api_type_combo.bind("<<ComboboxSelected>>", api_type_changed)
 
         ttk.Label(panel, text="模型").grid(row=3, column=0, sticky="w", pady=8)
         model_combo = ttk.Combobox(
@@ -3800,7 +3902,12 @@ class CodexAgentConsole:
 
             def worker() -> None:
                 try:
-                    models = fetch_custom_api_models(base_url, auth_mode, api_key)
+                    models = fetch_custom_api_models(
+                        base_url,
+                        auth_mode,
+                        api_key,
+                        api_type=selected_api_type(),
+                    )
                     self.root.after(0, lambda: apply_models(models))
                 except Exception as exc:
                     self.root.after(0, lambda: apply_models([], str(exc)))
@@ -3839,9 +3946,7 @@ class CodexAgentConsole:
 
         def save_editor() -> None:
             auth_mode = selected_auth_mode()
-            api_type = {
-                label: key for key, label in CUSTOM_API_TYPE_LABELS.items()
-            }.get(api_type_var.get(), "chat_completions")
+            api_type = selected_api_type()
             existing_key = endpoint.encrypted_api_key if endpoint else ""
             key = key_var.get()
             if auth_mode == "none":

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add native Claude Messages (Anthropic) API detection with `x-api-key` authentication, Anthropic version headers, model discovery, streaming response parsing, usage parsing, and prompt-cache measurement.
+
 ## 1.3.9 - 2026-08-19
 
 - Add an opt-in custom API cache-hit benchmark with a cache warmup request, a repeated measurement request, and cache-hit reporting when the provider exposes input usage.
