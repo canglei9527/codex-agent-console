@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.7 - 2026-08-19
+
+- Fix execution-agent model inheritance: delegations now explicitly use `fork_turns = "none"` together with the configured subagent model and reasoning effort, instead of inheriting the primary model through a full-history fork.
+- Change dual-model orchestration to a teacher-executor loop: the main model gives concise guidance, reviews the result, requests focused corrections, and only takes over remaining work when the executor cannot finish.
+- Add a completion-first rule so implementation tasks must progress through available tools and verification instead of ending with only a plan or advice.
+- Add an "Apply to Desktop" action that reloads only the detected Windows Desktop `app-server`, so new tasks can use saved settings without closing the Desktop window.
+
 ## 1.3.6 - 2026-08-19
 
 - Correct execution-agent statistics when a forked subagent session embeds parent session metadata.

@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.3.7"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -90,7 +90,15 @@ def build_dual_mode_policy(subagent_model: str, subagent_effort: str) -> str:
     model = _policy_value(subagent_model)
     effort = _policy_value(subagent_effort)
     return f"""{DUAL_MODE_POLICY_START}
-First make only a routing decision, without doing substantive task work. Treat every clear, bounded, low-risk, non-conversational user request as simple work, including coding, writing, rewriting, translation, summarization, data transformation, file operations, and targeted research. This instruction is an explicit request to use a subagent; do not wait for the user to ask separately. For simple work, do not plan, decompose, inspect, implement, test, or produce the requested result in the primary agent. Immediately hand the complete user request, relevant context, constraints, and acceptance criteria to exactly one custom execution subagent named `{MANAGED_EXECUTOR_AGENT_NAME}` through the available multi-agent tools. That subagent owns planning, tool use, implementation, testing, integration, and the complete work product. The primary agent must wait for the subagent to finish and then relay its result with minimal additional processing. Only greetings, casual conversation, status updates, clarification questions, and direct answers that require no task work stay in the primary agent. For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning, decomposition, integration, and final review. Delegate all bounded execution work to the `{MANAGED_EXECUTOR_AGENT_NAME}` subagent through the available multi-agent tools. The `{MANAGED_EXECUTOR_AGENT_NAME}` configuration is authoritative for model `{model}` and reasoning effort `{effort}`; do not substitute a built-in worker, explorer, guardian, or inherited default. If the execution subagent tool is unavailable for simple work, report the blocker instead of silently taking over the task. Only use a different execution model or effort when the user explicitly requests it or the configured combination is unavailable.
+The primary model is the teacher and accountable owner; `{MANAGED_EXECUTOR_AGENT_NAME}` is the hands-on execution student. For work requests, make a quick routing decision and act in the same turn. Do not substitute a plan, speculation, or a list of things the user should do for the requested work.
+
+For a clear, bounded, low-risk task, the teacher writes a compact task brief and delegates the complete execution to exactly one `{MANAGED_EXECUTOR_AGENT_NAME}`. Keep the teacher's own work to routing, concise guidance, and review; do not independently solve the task before the student responds. The task brief must contain the goal, relevant context or file paths, constraints, and concrete acceptance checks.
+
+Every `spawn_agent` call for this execution student must explicitly use `agent_type` `{MANAGED_EXECUTOR_AGENT_NAME}`, `fork_turns` `"none"`, `model` `{model}`, and `reasoning_effort` `{effort}`. Never use `fork_turns` `"all"` or omit these model fields for this agent: a full-history fork inherits the expensive primary model. Do not substitute a built-in worker, explorer, guardian, or inherited default unless the user explicitly requests it or the configured combination is unavailable.
+
+The student owns inspection, tool use, implementation, validation, and a concrete handoff. After its response, the teacher checks the acceptance criteria. If the result is incomplete, give the same student focused corrective feedback with `followup_task` and require it to finish; do not redo the work prematurely. If the student is unavailable or cannot finish after guided correction, the teacher must actively complete the remaining work when the available tools permit it, and briefly disclose that fallback in the final response.
+
+For complex, ambiguous, multi-step, or cross-cutting work, the teacher plans, decomposes, teaches the execution approach, delegates bounded implementation units using the exact spawn settings above, then integrates and reviews the result. Before ending any change/build/fix task, perform the relevant verification. Ask the user only for a decision that genuinely blocks safe completion; otherwise make a reasonable assumption and finish the work in the current turn. Never end with only an intention to act later when an available tool can make progress now.
 {DUAL_MODE_POLICY_END}"""
 
 
@@ -121,7 +129,7 @@ description = "Dedicated end-to-end execution agent managed by Codex Agent Conso
 model = {json.dumps(_policy_value(model))}
 model_reasoning_effort = {json.dumps(_policy_value(effort))}
 developer_instructions = """
-Own delegated execution work end-to-end. Plan, inspect, implement, validate, and report the complete result. Keep work scoped to the delegated request and return a concise handoff to the parent agent.
+You are the execution student for a primary teacher. Treat a delegated task as authorization to act: inspect, implement, validate, and return the complete result. Do not answer with only a plan, speculation, or instructions for the parent or user. Use the available tools and existing project patterns, make safe low-risk assumptions when possible, and finish the requested work in this turn. If a focused correction arrives, apply it and re-validate. Report the files changed, verification performed, and only concrete remaining blockers.
 """
 '''
 
@@ -387,6 +395,163 @@ class ConfigStore:
                 os.remove(temp_name)
         self._save_global_instruction_policy(settings)
         return backup
+
+
+@dataclass(frozen=True)
+class DesktopBackendProcess:
+    pid: int
+    parent_pid: int
+    name: str
+    executable_path: str
+    command_line: str
+
+
+@dataclass(frozen=True)
+class DesktopBackendReloadResult:
+    status: str
+    pids: tuple[int, ...] = ()
+    error: str = ""
+
+
+class DesktopBackendReloader:
+    """Reload only the Desktop-owned Codex app-server, never a standalone CLI."""
+
+    _DESKTOP_CODEX_PATH = "\\app\\resources\\codex.exe"
+
+    @staticmethod
+    def _normalized_path(value: str) -> str:
+        return value.replace("/", "\\").casefold()
+
+    @classmethod
+    def _has_desktop_ancestor(
+        cls,
+        process: DesktopBackendProcess,
+        processes_by_pid: dict[int, DesktopBackendProcess],
+    ) -> bool:
+        current_pid = process.parent_pid
+        for _ in range(8):
+            parent = processes_by_pid.get(current_pid)
+            if parent is None:
+                return False
+            path = cls._normalized_path(parent.executable_path)
+            if (
+                parent.name.casefold() == "chatgpt.exe"
+                and "\\windowsapps\\openai.codex_" in path
+            ):
+                return True
+            current_pid = parent.parent_pid
+        return False
+
+    @classmethod
+    def select_desktop_backends(
+        cls, processes: list[DesktopBackendProcess]
+    ) -> list[DesktopBackendProcess]:
+        processes_by_pid = {process.pid: process for process in processes}
+        selected: list[DesktopBackendProcess] = []
+        for process in processes:
+            path = cls._normalized_path(process.executable_path)
+            command_line = process.command_line.casefold()
+            is_desktop_binary = (
+                "\\windowsapps\\openai.codex_" in path
+                and path.endswith(cls._DESKTOP_CODEX_PATH)
+            )
+            is_app_server = re.search(r"(?:^|\s)app-server(?:\s|$)", command_line)
+            if (
+                process.name.casefold() == "codex.exe"
+                and is_desktop_binary
+                and is_app_server
+                and cls._has_desktop_ancestor(process, processes_by_pid)
+            ):
+                selected.append(process)
+        return selected
+
+    @staticmethod
+    def _creation_flags() -> int:
+        return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+    def _read_processes(self) -> list[DesktopBackendProcess]:
+        if os.name != "nt":
+            return []
+        command = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine | "
+            "ConvertTo-Json -Compress"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=self._creation_flags(),
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise RuntimeError(detail or "无法读取 Windows 进程列表")
+        if not result.stdout.strip():
+            return []
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Windows 进程列表格式无效") from exc
+        rows = data if isinstance(data, list) else [data]
+        processes: list[DesktopBackendProcess] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            try:
+                pid = int(row.get("ProcessId") or 0)
+                parent_pid = int(row.get("ParentProcessId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if pid <= 0:
+                continue
+            processes.append(
+                DesktopBackendProcess(
+                    pid=pid,
+                    parent_pid=parent_pid,
+                    name=str(row.get("Name") or ""),
+                    executable_path=str(row.get("ExecutablePath") or ""),
+                    command_line=str(row.get("CommandLine") or ""),
+                )
+            )
+        return processes
+
+    def find(self) -> list[DesktopBackendProcess]:
+        return self.select_desktop_backends(self._read_processes())
+
+    def reload(
+        self, processes: list[DesktopBackendProcess] | None = None
+    ) -> DesktopBackendReloadResult:
+        if os.name != "nt":
+            return DesktopBackendReloadResult("unsupported")
+        candidates = self.find() if processes is None else processes
+        if not candidates:
+            return DesktopBackendReloadResult("not_running")
+        stopped: list[int] = []
+        failures: list[str] = []
+        for process in candidates:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=self._creation_flags(),
+                check=False,
+            )
+            if result.returncode == 0:
+                stopped.append(process.pid)
+            else:
+                detail = (result.stderr or result.stdout).strip()
+                failures.append(f"PID {process.pid}: {detail or '终止失败'}")
+        if stopped:
+            return DesktopBackendReloadResult(
+                "reloaded", tuple(stopped), "\n".join(failures)
+            )
+        return DesktopBackendReloadResult("failed", error="\n".join(failures))
 
 
 @dataclass
@@ -2001,6 +2166,7 @@ class CodexAgentConsole:
         self.root = root
         self.home = home or codex_home()
         self.config_store = ConfigStore(self.home / "config.toml")
+        self.desktop_backend_reloader = DesktopBackendReloader()
         self.custom_api_store = CustomApiStore(self.home / CUSTOM_API_CONFIG_NAME)
         self.stats_reader = SessionStatsReader(self.home / "sessions")
         self._refresh_running = False
@@ -2132,7 +2298,7 @@ class CodexAgentConsole:
         mode_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         ttk.Radiobutton(
             mode_frame,
-            text="双模型协调（简单直传 + 复杂主规划）",
+            text="双模型协作（主模型教学 + 子模型执行）",
             variable=self.mode_var,
             value="multi",
         ).pack(side="left", padx=(0, 18))
@@ -2185,6 +2351,11 @@ class CodexAgentConsole:
             text="恢复普通模式",
             command=self.restore_normal_mode,
         ).pack(side="left")
+        ttk.Button(
+            button_row,
+            text="立即应用到 Desktop",
+            command=self.apply_to_desktop,
+        ).pack(side="left", padx=(8, 0))
 
         ttk.Button(parent, text="打开配置文件", command=self.open_config).grid(
             row=row + 1, column=0, columnspan=2, sticky="w", pady=(10, 0)
@@ -2192,8 +2363,10 @@ class CodexAgentConsole:
 
         ttk.Label(
             parent,
-            text="简单任务（含写作、编码等）由子模型全程执行；复杂任务由主模型规划、整合和审查。策略写入全局 AGENTS.md，重启 Codex 后新任务生效。",
+            text="主模型负责交代、复核和必要收尾；子模型执行与验证。执行调用显式使用子模型模型和思考级别，避免继承主模型。点击“立即应用到 Desktop”即可让新任务加载设置。",
             style="Muted.TLabel",
+            wraplength=430,
+            justify="left",
         ).grid(row=row + 2, column=0, columnspan=2, sticky="w", pady=(14, 0))
 
     def _add_combo_row(
@@ -2351,7 +2524,7 @@ class CodexAgentConsole:
             messagebox.showerror(APP_NAME, f"保存失败：{exc}")
             return False
         mode = "全局 AGENTS 双模型策略已写入" if settings.agents_enabled else "普通模式已恢复"
-        self.status_var.set(f"已保存 · {mode} · 重启 Codex 后新任务生效")
+        self.status_var.set(f"已保存 · {mode} · 点击“立即应用到 Desktop”加载到新任务")
         return True
 
     def enable_dual_mode(self) -> None:
@@ -2359,7 +2532,7 @@ class CodexAgentConsole:
         if self.save_settings():
             messagebox.showinfo(
                 APP_NAME,
-                "简单直传、复杂主规划策略已写入。\n\n请完全退出并重新打开 Codex Desktop，再新建任务；当前对话不会热切换。",
+                "主模型教学、子模型执行策略已写入。\n\n点击“立即应用到 Desktop”只重载后台服务；当前对话不会热切换。",
             )
 
     def restore_normal_mode(self) -> None:
@@ -2367,8 +2540,55 @@ class CodexAgentConsole:
         if self.save_settings():
             messagebox.showinfo(
                 APP_NAME,
-                "已恢复普通单代理模式。\n\n请在 Codex 中新建任务；当前对话不会热切换。",
+                "已恢复普通单代理模式。\n\n点击“立即应用到 Desktop”只重载后台服务；当前对话不会热切换。",
             )
+
+    def apply_to_desktop(self) -> None:
+        if not self.save_settings():
+            return
+        try:
+            backends = self.desktop_backend_reloader.find()
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"无法检测 Desktop 后端：{exc}")
+            return
+        if not backends:
+            self.status_var.set("已保存 · 未检测到 Desktop 后端 · 下次启动或新建任务时加载")
+            messagebox.showinfo(
+                APP_NAME,
+                "未检测到正在运行的 Codex Desktop 后端。\n\n设置已保存，将在下次启动 Desktop 或新建任务时加载。",
+            )
+            return
+        if not messagebox.askyesno(
+            APP_NAME,
+            "将只重载 Codex Desktop 的后台 app-server，不会关闭 Desktop 窗口。\n\n"
+            "正在运行的任务会被中断，已有任务不会热切换。确认立即应用到后续新任务？",
+            icon="warning",
+        ):
+            self.status_var.set("已保存 · Desktop 后端未重载")
+            return
+        result = self.desktop_backend_reloader.reload(backends)
+        if result.status == "reloaded":
+            details = ""
+            if result.error:
+                details = f"\n\n部分后端未能重载：\n{result.error}"
+            self.status_var.set("Desktop 后端已重载 · 新任务将使用当前设置")
+            messagebox.showinfo(
+                APP_NAME,
+                "Desktop 后端已重载，窗口保持打开。\n\n"
+                "请新建任务使用当前模型与双模型策略；已有任务保持原设置。"
+                + details,
+            )
+            return
+        if result.status == "unsupported":
+            messagebox.showinfo(
+                APP_NAME,
+                "当前系统不支持 Desktop 后端重载。设置已保存，将在下次启动时加载。",
+            )
+            return
+        messagebox.showerror(
+            APP_NAME,
+            f"Desktop 后端未能重载：{result.error or '未知错误'}",
+        )
 
     def _period_days(self) -> int | None:
         return {"今天": 1, "7天": 7, "30天": 30, "全部": None}.get(

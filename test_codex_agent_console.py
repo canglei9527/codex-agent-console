@@ -13,6 +13,8 @@ from pathlib import Path
 from codex_agent_console import (
     AgentSettings,
     ConfigStore,
+    DesktopBackendProcess,
+    DesktopBackendReloader,
     CustomApiBenchmarkRunner,
     CustomApiEndpoint,
     CustomApiResult,
@@ -134,8 +136,8 @@ class ConfigStoreTests(unittest.TestCase):
             enabled_instructions = agents.read_text(encoding="utf-8")
             self.assertEqual(enabled_instructions.count(DUAL_MODE_POLICY_START), 1)
             self.assertIn("Keep my global instruction.", enabled_instructions)
-            self.assertIn("model `gpt-5.6-terra`", enabled_instructions)
-            self.assertIn("reasoning effort `medium`", enabled_instructions)
+            self.assertIn("`model` `gpt-5.6-terra`", enabled_instructions)
+            self.assertIn("`reasoning_effort` `medium`", enabled_instructions)
             self.assertTrue(has_dual_mode_policy(enabled_instructions))
             self.assertTrue(store.load().agents_enabled)
             self.assertEqual(
@@ -210,28 +212,87 @@ class ConfigStoreTests(unittest.TestCase):
         self.assertTrue(has_dual_mode_policy(enabled))
         self.assertEqual(merge_dual_mode_policy(enabled, False), "")
 
-    def test_dual_mode_policy_routes_simple_work_to_complete_subagent(self):
+    def test_dual_mode_policy_routes_work_to_a_separate_teacher_guided_executor(self):
         policy = build_dual_mode_policy("gpt-5.6-terra", "low")
         self.assertIn(
-            "Treat every clear, bounded, low-risk, non-conversational user request as simple work",
+            "The primary model is the teacher and accountable owner",
             policy,
         )
-        self.assertIn("including coding, writing, rewriting, translation", policy)
-        self.assertIn("exactly one custom execution subagent", policy)
+        self.assertIn("exactly one `codex_agent_console_executor`", policy)
         self.assertIn(MANAGED_EXECUTOR_AGENT_NAME, policy)
-        self.assertIn("That subagent owns planning, tool use, implementation, testing", policy)
+        self.assertIn("student owns inspection, tool use, implementation, validation", policy)
         self.assertIn(
-            "do not plan, decompose, inspect, implement, test, or produce the requested result in the primary agent",
+            '`fork_turns` `"none"`',
             policy,
         )
         self.assertIn(
-            "For complex, ambiguous, multi-step, or cross-cutting work, use the primary agent for planning",
+            "Never use `fork_turns` `\"all\"`",
             policy,
         )
-        self.assertIn("report the blocker instead of silently taking over the task", policy)
-        self.assertIn("model `gpt-5.6-terra`", policy)
-        self.assertIn("reasoning effort `low`", policy)
-        self.assertNotIn("For every task that requires work", policy)
+        self.assertIn("followup_task", policy)
+        self.assertIn("must actively complete the remaining work", policy)
+        self.assertIn("Never end with only an intention to act later", policy)
+        self.assertIn("`model` `gpt-5.6-terra`", policy)
+        self.assertIn("`reasoning_effort` `low`", policy)
+        self.assertNotIn("Act as a thin dispatcher", policy)
+
+
+class DesktopBackendReloaderTests(unittest.TestCase):
+    def test_selects_only_desktop_owned_app_servers(self):
+        desktop_path = (
+            "C:\\Program Files\\WindowsApps\\"
+            "OpenAI.Codex_26.814.5167.0_x64__2p2nqsd0c76g0\\app"
+        )
+        desktop = DesktopBackendProcess(
+            10, 1, "ChatGPT.exe", f"{desktop_path}\\ChatGPT.exe", "ChatGPT.exe"
+        )
+        backend = DesktopBackendProcess(
+            11,
+            10,
+            "codex.exe",
+            f"{desktop_path}\\resources\\codex.exe",
+            'codex.exe -c features.code_mode_host=true app-server',
+        )
+        standalone_cli = DesktopBackendProcess(
+            12,
+            1,
+            "codex.exe",
+            "C:\\Users\\me\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe",
+            "codex.exe app-server",
+        )
+        wrong_parent = DesktopBackendProcess(
+            13,
+            99,
+            "codex.exe",
+            f"{desktop_path}\\resources\\codex.exe",
+            "codex.exe app-server",
+        )
+
+        selected = DesktopBackendReloader.select_desktop_backends(
+            [desktop, backend, standalone_cli, wrong_parent]
+        )
+
+        self.assertEqual(selected, [backend])
+
+    def test_rejects_desktop_codex_without_app_server_command(self):
+        desktop_path = (
+            "C:\\Program Files\\WindowsApps\\"
+            "OpenAI.Codex_26.814.5167.0_x64__2p2nqsd0c76g0\\app"
+        )
+        desktop = DesktopBackendProcess(
+            1, 0, "ChatGPT.exe", f"{desktop_path}\\ChatGPT.exe", "ChatGPT.exe"
+        )
+        utility = DesktopBackendProcess(
+            2,
+            1,
+            "codex.exe",
+            f"{desktop_path}\\resources\\codex.exe",
+            "codex.exe exec status",
+        )
+
+        self.assertEqual(
+            DesktopBackendReloader.select_desktop_backends([desktop, utility]), []
+        )
 
 
 class SessionStatsTests(unittest.TestCase):

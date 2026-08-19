@@ -2,7 +2,7 @@
 
 一个非官方的 Codex Windows 桌面控制台，用于管理主模型、子代理默认值和双模型协调策略，并查看本机 Token 与缓存命中统计。
 
-当前版本：`1.3.6`
+当前版本：`1.3.7`
 
 > 本项目是社区工具，不是 OpenAI 官方产品。它只修改 Codex 官方支持的本地配置项。
 
@@ -15,8 +15,9 @@
 - 主模型：`model`、`model_reasoning_effort`
 - 子代理：`agents.default_subagent_model`、`agents.default_subagent_reasoning_effort`
 - 模式：`agents.enabled = true|false`
-- 双模型协调策略：启用时写入全局 `~/.codex/AGENTS.md`（非空 `AGENTS.override.md` 优先），将简单、明确、低风险的写作、编码、改写、翻译、总结等任务直接交给一个专属子模型全程完成；复杂、模糊、多步骤或跨模块工作仍由主模型规划、拆解、整合和审查
-- 专属执行子模型：保存时在 `~/.codex/agents/` 写入受控代理文件，模型和思考级别严格使用 GUI 选择值，优先级高于子代理默认值
+- 双模型协作：启用时写入全局 `~/.codex/AGENTS.md`（非空 `AGENTS.override.md` 优先）。主模型作为老师负责任务交代、复核、二次指导和必要收尾；子模型负责实际检查、修改和验证
+- 专属执行子模型：每次派发显式传入 GUI 选择的模型、思考级别和 `fork_turns = "none"`，避免完整历史分叉继承主模型；保存时也在 `~/.codex/agents/` 写入受控代理文件
+- 完成优先：变更、修复和构建任务必须用工具推进到可验证结果，不能用“应该如何做”的建议或未来计划替代执行；子模型受阻时主模型会先指导修正，必要时直接收尾
 - 一键按钮：“启用双模型”与“恢复普通模式”
 - 并发：`agents.max_concurrent_threads_per_session`
 - 统计：主任务与执行子模型分别显示输入、缓存输入、输出、推理输出、总 Token、缓存命中率，以及会话实际使用的模型/思考级别；系统 guardian 后台会话不混入执行子模型统计
@@ -29,7 +30,7 @@
 - 自定义测速：比较成功率、平均首响应、平均总耗时、耗时波动和 Tokens/s，并标出最快与最稳定接口
 - API Key 安全：支持 Bearer、`x-api-key` 和无鉴权；Key 使用 Windows DPAPI 加密，不明文写入配置或显示在界面中
 
-配置保存前会备份为 `~/.codex/config.toml.codex-agent-console.bak`。控制台只增删全局 `AGENTS.md` 或 `AGENTS.override.md` 中自己带标记的协调策略，不会覆盖已有的用户规则；旧版本写入 `developer_instructions` 的标记会自动迁移清除。保存后必须完全退出并重新打开 Codex Desktop，再新建任务；当前会话不会热切换。
+配置保存前会备份为 `~/.codex/config.toml.codex-agent-console.bak`。控制台只增删全局 `AGENTS.md` 或 `AGENTS.override.md` 中自己带标记的协调策略，不会覆盖已有的用户规则；旧版本写入 `developer_instructions` 的标记会自动迁移清除。点击“立即应用到 Desktop”后，程序只重载经过路径、命令行和父进程校验的 Desktop `app-server`，不会关闭 Desktop 窗口；运行中的任务会中断，已有任务不会热切换，新任务会使用新设置。未检测到 Desktop 时，设置会在下次启动或新建任务时加载。
 
 ## API 诊断
 
