@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.8 - 2026-08-19
+
+- Fix the “Today” Token filter to start at the local computer's midnight instead of including the previous 24 hours of sessions.
+- Keep the 7-day and 30-day filters as rolling windows.
+
 ## 1.3.7 - 2026-08-19
 
 - Fix execution-agent model inheritance: delegations now explicitly use `fork_turns = "none"` together with the configured subagent model and reasoning effort, instead of inheriting the primary model through a full-history fork.

@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.3.7"
+APP_VERSION = "1.3.8"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -2124,16 +2124,31 @@ class SessionStatsReader:
         self._cache[path] = (stat.st_mtime_ns, stat.st_size, parsed)
         return parsed
 
-    def aggregate(self, days: int | None = 7) -> tuple[Usage, Usage]:
+    def aggregate(
+        self,
+        days: int | None = 7,
+        *,
+        calendar_day: bool = False,
+        now: datetime | None = None,
+    ) -> tuple[Usage, Usage]:
         main = Usage()
         subagent = Usage()
         if not self.sessions_dir.exists():
             return main, subagent
-        cutoff = (
-            datetime.now(timezone.utc) - timedelta(days=days)
-            if days is not None
-            else None
-        )
+        if now is None:
+            local_now = datetime.now().astimezone()
+        elif now.tzinfo is None:
+            local_now = now.replace(tzinfo=timezone.utc).astimezone()
+        else:
+            local_now = now
+        if calendar_day:
+            cutoff = local_now.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(timezone.utc)
+        elif days is not None:
+            cutoff = local_now.astimezone(timezone.utc) - timedelta(days=days)
+        else:
+            cutoff = None
         paths = list(self.sessions_dir.rglob("*.jsonl"))
         live_paths = set(paths)
         for stale in set(self._cache) - live_paths:
@@ -2600,10 +2615,11 @@ class CodexAgentConsole:
             return
         self._refresh_running = True
         days = self._period_days()
+        calendar_day = self.period_var.get() == "今天"
 
         def worker() -> None:
             try:
-                result = self.stats_reader.aggregate(days)
+                result = self.stats_reader.aggregate(days, calendar_day=calendar_day)
                 self.root.after(0, lambda: self._apply_stats(*result))
             except Exception as exc:
                 self.root.after(0, lambda: self.status_var.set(f"统计失败：{exc}"))

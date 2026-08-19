@@ -302,8 +302,9 @@ class SessionStatsTests(unittest.TestCase):
         thread_source: str,
         totals: list[dict],
         source: dict | None = None,
+        started_at: datetime | None = None,
     ) -> None:
-        now = datetime.now(timezone.utc).isoformat()
+        now = (started_at or datetime.now(timezone.utc)).isoformat()
         metadata = {
             "timestamp": now,
             "thread_source": thread_source,
@@ -467,6 +468,49 @@ class SessionStatsTests(unittest.TestCase):
                 SessionStatsReader(sessions)._parse_file(sessions / "execution.jsonl").started_at,
                 datetime.fromisoformat(child_started),
             )
+
+    def test_today_uses_local_calendar_day_not_previous_24_hours(self):
+        with tempfile.TemporaryDirectory() as temp:
+            sessions = Path(temp)
+            local_timezone = timezone(timedelta(hours=8))
+            now = datetime(2026, 8, 19, 9, 0, tzinfo=local_timezone)
+            yesterday = datetime(2026, 8, 18, 23, 59, 59, tzinfo=local_timezone)
+            today = datetime(2026, 8, 19, 0, 0, tzinfo=local_timezone)
+            self._write_session(
+                sessions / "yesterday-main.jsonl",
+                "user",
+                [{"total_tokens": 100}],
+                started_at=yesterday,
+            )
+            self._write_session(
+                sessions / "today-main.jsonl",
+                "user",
+                [{"total_tokens": 200}],
+                started_at=today,
+            )
+            self._write_session(
+                sessions / "yesterday-subagent.jsonl",
+                "subagent",
+                [{"total_tokens": 300}],
+                started_at=yesterday,
+            )
+            self._write_session(
+                sessions / "today-subagent.jsonl",
+                "subagent",
+                [{"total_tokens": 400}],
+                started_at=today,
+            )
+
+            reader = SessionStatsReader(sessions)
+            main, subagent = reader.aggregate(1, calendar_day=True, now=now)
+            rolling_main, rolling_subagent = reader.aggregate(1, now=now)
+
+            self.assertEqual(main.sessions, 1)
+            self.assertEqual(main.total_tokens, 200)
+            self.assertEqual(subagent.sessions, 1)
+            self.assertEqual(subagent.total_tokens, 400)
+            self.assertEqual(rolling_main.sessions, 2)
+            self.assertEqual(rolling_subagent.sessions, 2)
 
 
 class DiagnosticLogicTests(unittest.TestCase):
