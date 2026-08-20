@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.1 - 2026-08-20
+
+- Ignore SSE heartbeat/comment lines during custom API benchmarks so compatible Claude Messages responses are not incorrectly parsed as plain JSON errors.
+
 ## 1.4.0 - 2026-08-19
 
 - Add native Claude Messages (Anthropic) API detection with `x-api-key` authentication, Anthropic version headers, model discovery, streaming response parsing, usage parsing, and prompt-cache measurement.

@@ -1161,6 +1161,7 @@ class CustomApiTests(unittest.TestCase):
                 self.send_header("Content-Type", "text/event-stream")
                 self.end_headers()
                 chunks = (
+                    b": keep-alive\n\n",
                     b"event: message_start\n\n"
                     b'data: {"type":"message_start","message":{"usage":'
                     b'{"input_tokens":120,"cache_creation_input_tokens":0,'

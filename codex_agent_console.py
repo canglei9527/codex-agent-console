@@ -31,7 +31,7 @@ from tkinter import messagebox, ttk
 
 
 APP_NAME = "Codex Agent Console"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 AUTO_REFRESH_MS = 1000
 DIAGNOSTIC_CLEANUP_GRACE_SECONDS = 5.0
 DIAGNOSTIC_PROMPT = (
@@ -2129,7 +2129,7 @@ class CustomApiBenchmarkRunner:
                             cached_input_tokens, event_cached_input_tokens
                         )
                         input_tokens_reported = True
-                elif line.startswith(("event:", "id:", "retry:")):
+                elif line.startswith(("event:", "id:", "retry:", ":")):
                     continue
                 else:
                     plain_body.append(raw_line)
